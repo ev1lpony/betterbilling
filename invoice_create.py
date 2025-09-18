@@ -3,30 +3,34 @@ from __future__ import annotations
 import sys
 import os
 import io
-import json
+import re
 from datetime import datetime
 from typing import List
+from pathlib import Path
 
 # ---- Core / helpers ----
 from fpdf import FPDF, XPos, YPos
 
-PAGE_FORMAT     = 'Letter'
-FONT_FAMILY     = 'Helvetica'
+PAGE_FORMAT      = 'Letter'
+FONT_FAMILY      = 'Helvetica'
+MAX_FONT_PT      = 14
+MIN_FONT_PT      = 10
+LEFT_MARGIN_MM   = 15
+TOP_MARGIN_MM    = 20
+BOTTOM_MARGIN_MM = 5  # safety margin at bottom
 
-MAX_FONT_PT     = 14
-MIN_FONT_PT     = 10
-
-LEFT_MARGIN_MM  = 15
-TOP_MARGIN_MM   = 20
-LETTERHEAD_INCH = 2.5
-BOTTOM_MARGIN_MM = 5
-
-SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".betterbilling_settings.json")
-
+# Centralized app settings
+import settings
 
 def mm_from_inches(inches: float) -> float:
     return inches * 25.4
 
+def letterhead_margin_in() -> float:
+    """Top letterhead margin (inches) from settings, default 2.5in."""
+    try:
+        return float(settings.get("letterhead.top_margin_in", 2.5))
+    except Exception:
+        return 2.5
 
 def normalize_desc(s: str) -> str:
     s = s.strip()
@@ -34,11 +38,14 @@ def normalize_desc(s: str) -> str:
         return s
     return s[0].upper() + s[1:]
 
-
 def paginate_table(pdf, rows, col_widths, headers, alignments=None):
+    """
+    Draw rows + headers with auto-pagination and auto-shrink for overflow.
+    Assumes pdf.font_size_pt & pdf.ln_height_mm already set.
+    """
     x0        = LEFT_MARGIN_MM
     row_h     = pdf.ln_height_mm
-    usable    = pdf.h - mm_from_inches(LETTERHEAD_INCH) - TOP_MARGIN_MM - BOTTOM_MARGIN_MM
+    usable    = pdf.h - mm_from_inches(letterhead_margin_in()) - TOP_MARGIN_MM - BOTTOM_MARGIN_MM
     base_size = pdf.font_size_pt
     min_size  = MIN_FONT_PT
 
@@ -60,10 +67,11 @@ def paginate_table(pdf, rows, col_widths, headers, alignments=None):
     for row in rows:
         if pdf.get_y() + row_h > usable:
             pdf.add_page()
-            pdf.set_y(mm_from_inches(LETTERHEAD_INCH))
+            pdf.set_y(mm_from_inches(letterhead_margin_in()))
             draw_header()
         pdf.set_x(x0)
         for w, cell, alg in zip(col_widths, row, alignments):
+            # measure and shrink if needed
             text_w = pdf.get_string_width(cell)
             if text_w > w - 2:
                 scale    = (w - 2) / text_w
@@ -76,7 +84,6 @@ def paginate_table(pdf, rows, col_widths, headers, alignments=None):
         pdf.ln(row_h)
         fill = not fill
 
-
 def parse_input_date(s: str) -> datetime:
     parts = s.strip().split('/')
     if len(parts) == 2:
@@ -88,10 +95,8 @@ def parse_input_date(s: str) -> datetime:
         raise ValueError("Use M/D or M/D/YY")
     return datetime(y, m, d)
 
-
 def format_date(dt: datetime) -> str:
     return f"{dt.month}/{dt.day}/{dt.strftime('%y')}"
-
 
 def parse_user_date(s: str) -> datetime:
     s = s.strip()
@@ -111,10 +116,34 @@ def parse_user_date(s: str) -> datetime:
         raise ValueError("Use M/D, M/D/YY, or M/D/YYYY")
     return datetime(y, m, d)
 
-
 def format_date_full(dt: datetime) -> str:
     return dt.strftime("%m/%d/%Y")
 
+# ----- Filename helpers (settings-driven) ------------------------------------
+
+def sanitize_client(name: str) -> str:
+    # keep letters, numbers, space, underscore, dash; collapse spaces to _
+    s = re.sub(r"[^A-Za-z0-9 _\-]", "", name).strip()
+    return re.sub(r"\s+", "_", s)
+
+def date_for_filename(ui_mmddyyyy: str) -> str:
+    # Convert UI date MM/DD/YYYY to MM-DD-YYYY for filenames
+    return ui_mmddyyyy.replace("/", "-")
+
+def render_filename_from_template(inv: "Invoice") -> str:
+    """
+    Applies settings.pdf.file_naming_template.
+    Supported vars: {client}, {date}
+    - {client}: sanitized (spaces -> _)
+    - {date}: MM-DD-YYYY (from UI invoice_date)
+    """
+    template = settings.get("pdf.file_naming_template", "{client}_invoice[{date}].pdf")
+    client = sanitize_client(inv.client_name)
+    date_str = date_for_filename(inv.invoice_date)
+    try:
+        return template.format(client=client, date=date_str)
+    except Exception:
+        return f"{client}_invoice[{date_str}].pdf"
 
 class LineItem:
     def __init__(self, date_obj, desc, hours, rate):
@@ -122,22 +151,18 @@ class LineItem:
         self.desc  = desc
         self.hours = hours
         self.rate  = rate
-
     @property
     def amount(self):
         return self.hours * self.rate
-
 
 class CostItem:
     def __init__(self, desc, qty, unit_price):
         self.desc       = desc
         self.qty        = qty
         self.unit_price = unit_price
-
     @property
     def total(self):
         return self.qty * self.unit_price
-
 
 class Invoice:
     def __init__(self, client_name, invoice_date, default_rate):
@@ -190,6 +215,7 @@ class Invoice:
         print(f"GRAND TOTAL: {self.grand_total():.2f}\n")
 
     def generate_pdf(self, filename=None):
+        # choose dynamic font
         svc_count  = len(self.services) + 1
         cost_count = len(self.costs) + 1
         total_rows = svc_count + cost_count + 6
@@ -197,7 +223,7 @@ class Invoice:
         for pt in range(MAX_FONT_PT, MIN_FONT_PT-1, -1):
             if total_rows * (pt*0.35) < (
                 FPDF(format=PAGE_FORMAT).h
-                - mm_from_inches(LETTERHEAD_INCH)
+                - mm_from_inches(letterhead_margin_in())
                 - TOP_MARGIN_MM
             ):
                 chosen_pt = pt
@@ -211,7 +237,8 @@ class Invoice:
         pdf.font_size_pt = chosen_pt
         pdf.ln_height_mm = chosen_pt * 0.35
 
-        pdf.set_y(mm_from_inches(LETTERHEAD_INCH))
+        # letterhead margin + heading
+        pdf.set_y(mm_from_inches(letterhead_margin_in()))
         pdf.set_font(FONT_FAMILY, 'B', chosen_pt+4)
         pdf.cell(0, pdf.ln_height_mm*2, "Invoice", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(pdf.ln_height_mm/2)
@@ -220,6 +247,7 @@ class Invoice:
         pdf.cell(0, pdf.ln_height_mm, f"Date:        {self.invoice_date}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(pdf.ln_height_mm)
 
+        # SERVICES table
         svc_rows = [
             [ format_date(i.date), i.desc, f"{i.hours:.2f}", f"{i.rate:,.2f}", f"{i.amount:,.2f}" ]
             for i in sorted(self.services, key=lambda x: x.date)
@@ -229,6 +257,7 @@ class Invoice:
         paginate_table(pdf, svc_rows, svc_col_w, headers=["Date","Service","Hrs","Rate","Amt"], alignments=svc_align)
         pdf.ln(pdf.ln_height_mm/2)
 
+        # TOTAL SERVICE FEES row
         row_h   = pdf.ln_height_mm
         w_label = sum(svc_col_w[:-1])
         label   = "TOTAL SERVICE FEES"
@@ -244,6 +273,7 @@ class Invoice:
         pdf.cell(svc_col_w[-1], row_h, f"{self.total_services():,.2f}", border=1, align='R')
         pdf.ln(row_h*1.5)
 
+        # COSTS table
         cost_rows = [
             [ c.desc, f"{c.qty:,.2f}", f"{c.unit_price:,.2f}", f"{c.total:,.2f}" ]
             for c in self.costs
@@ -253,6 +283,7 @@ class Invoice:
         paginate_table(pdf, cost_rows, cost_col_w, headers=["Description","Qty","Unit","Total"], alignments=cost_align)
         pdf.ln(pdf.ln_height_mm/2)
 
+        # TOTAL COSTS row
         w_label2 = sum(cost_col_w[:-1])
         label2   = "TOTAL COSTS"
         text_w2  = pdf.get_string_width(label2)
@@ -267,6 +298,7 @@ class Invoice:
         pdf.cell(cost_col_w[-1], row_h, f"{self.total_costs():,.2f}", border=1, align='R')
         pdf.ln(row_h*1.5)
 
+        # Boxed Grand Total
         pdf.set_font(FONT_FAMILY, 'B', chosen_pt+2)
         gt = f"GRAND TOTAL: {self.grand_total():,.2f}"
         w_gt = pdf.get_string_width(gt) + 6
@@ -275,11 +307,11 @@ class Invoice:
         pdf.set_line_width(0.5)
         pdf.cell(w_gt, row_h*1.2, gt, border=1, align='C')
 
+        # save
         safe_date = self.invoice_date.replace('/','-')
         out = filename or f"{self.client_name.replace(' ','_')}_invoice[{safe_date}].pdf"
         pdf.output(out)
         print(f"PDF saved as: {out}")
-
 
 # ---- UI ----
 from PySide6.QtCore import Qt, QUrl
@@ -290,11 +322,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QDesktopServices
 
-
 def default_pdf_filename(inv: Invoice) -> str:
-    safe_date = inv.invoice_date.replace('/', '-')
-    return f"{inv.client_name.replace(' ', '_')}_invoice[{safe_date}].pdf"
-
+    return render_filename_from_template(inv)
 
 class InvoiceWizard(QMainWindow):
     def __init__(self):
@@ -303,10 +332,10 @@ class InvoiceWizard(QMainWindow):
         self.setMinimumWidth(820)
 
         self.invoice: Invoice | None = None
-        self._settings_cache = {}
         self._suppress_service_table = False
         self._suppress_cost_table = False
         self._hours_dirty = False  # require explicit entry of hours (0 allowed if typed)
+        self.require_explicit_zero = True  # updated in load_settings()
 
         self.stack = QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -330,8 +359,10 @@ class InvoiceWizard(QMainWindow):
         self.rate_in = QDoubleSpinBox()
         self.rate_in.setDecimals(2)
         self.rate_in.setMinimum(0.01)
+               # max big enough
         self.rate_in.setMaximum(9999999.0)
         self.rate_in.setSingleStep(25.0)
+        # initial; will be overridden by settings
         self.rate_in.setValue(250.0)
 
         form1.addRow("Client's Name:", self.client_name_in)
@@ -352,6 +383,7 @@ class InvoiceWizard(QMainWindow):
 
         self.meta_next.clicked.connect(self.go_services)
 
+        # Load settings (rate, explicit-zero rule)
         self.load_settings()
 
         # --- Step 2: Services ---
@@ -370,7 +402,7 @@ class InvoiceWizard(QMainWindow):
         self.s_date.setText(datetime.now().strftime("%m/%d/%Y"))
         self.s_hours = QDoubleSpinBox()
         self.s_hours.setDecimals(2)
-        self.s_hours.setMinimum(0.0)
+        self.s_hours.setMinimum(0.0)  # explicit 0 required if setting says so
         self.s_hours.setMaximum(10000.0)
         self.s_hours.setSingleStep(0.25)
         # track explicit typing of hours
@@ -552,7 +584,10 @@ class InvoiceWizard(QMainWindow):
         inv_date = format_date_full(dt)
         self.date_in.setText(inv_date)
         self.invoice = Invoice(name, inv_date, rate)
-        self.save_settings()
+
+        # persist default rate through centralized settings
+        self.persist_rate_now()
+
         self.update_totals_labels()
         self.stack.setCurrentWidget(self.page_services)
 
@@ -615,10 +650,12 @@ class InvoiceWizard(QMainWindow):
         except ValueError:
             QMessageBox.warning(self, "Validation", "Use M/D, M/D/YY, or M/D/YYYY for the service date.")
             return
-        # require explicit entry for hours; typing '0' is allowed
-        if self.s_hours.value() == 0.0 and not self._hours_dirty:
+
+        # require explicit entry for hours; typing '0' is allowed (if setting requires)
+        if self.require_explicit_zero and self.s_hours.value() == 0.0 and not self._hours_dirty:
             QMessageBox.warning(self, "Validation", "Hours required. If this is a no-charge entry, type 0 explicitly.")
             return
+
         hrs = float(self.s_hours.value())
         if hrs < 0:
             QMessageBox.warning(self, "Validation", "Hours must be ≥ 0.")
@@ -825,21 +862,30 @@ class InvoiceWizard(QMainWindow):
     def export_pdf(self):
         if self.invoice is None:
             return
-        settings = self._get_settings()
-        last_dir = settings.get('last_export_dir') if isinstance(settings, dict) else None
-        if not last_dir or not os.path.isdir(last_dir):
+
+        # Pull default export dir from settings (ensures existence)
+        try:
+            export_dir = settings.get_export_dir(create=True)
+        except Exception:
+            export_dir = Path.home()
+
+        filename = default_pdf_filename(self.invoice)
+        outfile = Path(export_dir) / filename
+
+        # If path doesn't exist (or user wants a different folder), prompt and persist
+        if not outfile.parent.exists():
             chosen = QFileDialog.getExistingDirectory(self, "Choose export folder", os.path.expanduser("~"))
             if not chosen:
                 return
-            last_dir = chosen
-            self._set_setting('last_export_dir', last_dir)
-        filename = default_pdf_filename(self.invoice)
-        outfile = os.path.join(last_dir, filename)
+            settings.set_("general.default_export_dir", chosen)
+            outfile = Path(chosen) / filename
+
         try:
-            self.invoice.generate_pdf(filename=outfile)
+            self.invoice.generate_pdf(filename=str(outfile))
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to generate PDF:\n{e}")
             return
+
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("PDF saved")
@@ -850,28 +896,31 @@ class InvoiceWizard(QMainWindow):
         btn_menu = msg.addButton("Return to Menu", QMessageBox.ActionRole)
         btn_close = msg.addButton("Close", QMessageBox.RejectRole)
         msg.exec()
-        if msg.clickedButton() == btn_open:
+
+        clicked = msg.clickedButton()
+        if clicked == btn_open:
             try:
                 if sys.platform.startswith('win'):
-                    os.startfile(outfile)  # type: ignore[attr-defined]
+                    os.startfile(str(outfile))  # type: ignore[attr-defined]
                 else:
-                    QDesktopServices.openUrl(QUrl.fromLocalFile(outfile))
+                    QDesktopServices.openUrl(QUrl.fromLocalFile(str(outfile)))
             except Exception:
                 pass
-        elif msg.clickedButton() == btn_folder:
+        elif clicked == btn_folder:
             try:
                 if sys.platform.startswith('win'):
                     os.system(f'explorer /select,"{outfile}"')
                 else:
-                    folder = os.path.dirname(outfile)
+                    folder = str(outfile.parent)
                     QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
             except Exception:
                 pass
-        elif msg.clickedButton() in (btn_new, btn_menu):
+        elif clicked in (btn_new, btn_menu):
             self.start_new_invoice()
 
     # ---- Reset to meta (legacy back) ----
     def confirm_reset_to_meta(self):
+        # Keep the discard dialog (you okayed this)
         if self.invoice and (self.invoice.services or self.invoice.costs):
             res = QMessageBox.question(
                 self,
@@ -910,54 +959,26 @@ class InvoiceWizard(QMainWindow):
             self.status.showMessage(f"Services: ${svc_total:,.2f} | Hours: {hours_sum:.2f} | Costs: ${cost_total:,.2f} | Grand: ${grand:,.2f}")
 
     def load_settings(self):
+        # default rate
         try:
-            if os.path.exists(SETTINGS_FILE):
-                with open(SETTINGS_FILE, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                if isinstance(data, dict):
-                    if 'default_rate' in data:
-                        try:
-                            self.rate_in.setValue(float(data['default_rate']))
-                        except Exception:
-                            pass
-                    self._settings_cache = data
-                else:
-                    self._settings_cache = {}
-            else:
-                self._settings_cache = {}
+            rate = float(settings.get("general.default_rate", 250.0))
+            self.rate_in.setValue(rate if rate > 0 else 250.0)
         except Exception:
-            self._settings_cache = {}
+            self.rate_in.setValue(250.0)
+        # require explicit zero hours (default True)
+        self.require_explicit_zero = bool(settings.get("invoice.require_explicit_zero_hours", True))
 
-    def _get_settings(self):
-        return getattr(self, '_settings_cache', {})
-
-    def _set_setting(self, key: str, value):
-        data = self._get_settings()
+    def persist_rate_now(self):
         try:
-            data[key] = value
-            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f)
-            self._settings_cache = data
+            settings.set_("general.default_rate", float(self.rate_in.value()))
         except Exception:
             pass
-
-    def save_settings(self):
-        try:
-            data = self._get_settings()
-            data['default_rate'] = float(self.rate_in.value())
-            with open(SETTINGS_FILE, 'w', encoding='utf-8') as f:
-                json.dump(data, f)
-            self._settings_cache = data
-        except Exception:
-            pass
-
 
 def main():
     app = QApplication(sys.argv)
     w = InvoiceWizard()
     w.show()
     sys.exit(app.exec())
-
 
 if __name__ == '__main__':
     main()
