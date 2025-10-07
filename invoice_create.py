@@ -4,8 +4,9 @@ import sys
 import os
 import io
 import re
+from math import floor
 from datetime import datetime
-from typing import List
+from typing import List, Tuple, Set
 from pathlib import Path
 
 # ---- Core / helpers ----
@@ -18,12 +19,17 @@ MIN_FONT_PT      = 10
 LEFT_MARGIN_MM   = 15
 TOP_MARGIN_MM    = 20
 BOTTOM_MARGIN_MM = 5  # safety margin at bottom
+ROW_PAD_MM       = 0.8  # top/bottom padding inside each cell
+DESC_INNER_PAD_X = 1.0  # small left/right padding for desc when drawing text inside boxed cell
 
 # Centralized app settings
 import settings
 
+
+# ---------- Helpers ----------
 def mm_from_inches(inches: float) -> float:
     return inches * 25.4
+
 
 def letterhead_margin_in() -> float:
     """Top letterhead margin (inches) from settings, default 2.5in."""
@@ -32,57 +38,264 @@ def letterhead_margin_in() -> float:
     except Exception:
         return 2.5
 
+
+def page_top_y(pdf: FPDF) -> float:
+    """
+    Y coordinate at which content should start on the *current* page.
+    - Page 1: below letterhead
+    - Page 2+: regular top margin
+    """
+    return mm_from_inches(letterhead_margin_in()) if pdf.page_no() == 1 else TOP_MARGIN_MM
+
+
 def normalize_desc(s: str) -> str:
     s = s.strip()
     if not s:
         return s
     return s[0].upper() + s[1:]
 
+
+def _avg_char_mm(pdf: FPDF) -> float:
+    """
+    Crude average character width for current font/size, in mm.
+    Used only for emergency long-word breaking.
+    """
+    sample = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 "
+    w = pdf.get_string_width(sample)
+    return max(0.1, w / len(sample))
+
+
+def wrap_text_lines(pdf: FPDF, text: str, max_w_mm: float) -> List[str]:
+    """
+    Greedy word wrap with soft breakpoints and emergency splits for super-long tokens.
+    Returns list of lines that each fit within max_w_mm.
+    """
+    if not text:
+        return [""]
+
+    tokens = re.split(r'(\s+|[-,/;:])', text)
+    tokens = [t for t in tokens if t is not None]
+
+    lines: List[str] = []
+    cur = ""
+
+    def too_wide(s: str) -> bool:
+        return pdf.get_string_width(s) > max_w_mm - 0.5  # tiny safety
+
+    for tok in tokens:
+        if tok == "":
+            continue
+        candidate = (cur + tok) if cur else tok
+
+        if not too_wide(candidate):
+            cur = candidate
+            continue
+
+        # If single token too long -> emergency split by approximate chars
+        if pdf.get_string_width(tok) > max_w_mm - 0.5:
+            if cur:
+                lines.append(cur.rstrip())
+                cur = ""
+            avg = _avg_char_mm(pdf)
+            # conservative: keep a little margin
+            cap = max(1, int((max_w_mm - 0.5) / max(avg, 0.1)))
+            buf = []
+            for ch in tok:
+                buf.append(ch)
+                if pdf.get_string_width("".join(buf)) > max_w_mm - 0.5:
+                    last = buf.pop()
+                    if buf:
+                        lines.append("".join(buf))
+                    buf = [last]
+            cur = "".join(buf)
+            continue
+
+        # break before token
+        if cur:
+            lines.append(cur.rstrip())
+        cur = tok.lstrip()
+
+    if cur:
+        lines.append(cur.rstrip())
+
+    return lines or [""]
+
+
+def _draw_header(pdf: FPDF, col_widths: List[float], headers: List[str], row_h: float):
+    pdf.set_x(LEFT_MARGIN_MM)
+    pdf.set_font(FONT_FAMILY, 'B', pdf.font_size_pt)
+    pdf.set_fill_color(200, 220, 255)
+    for w, h in zip(col_widths, headers):
+        pdf.cell(w, row_h, h, border=1, align='C', fill=True,
+                 new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.ln(row_h)
+    pdf.set_font(FONT_FAMILY, '', pdf.font_size_pt)
+    pdf.set_fill_color(245, 245, 245)
+
+
+def _ensure_room_or_new_page(pdf: FPDF, needed_h: float, redraw_header_cb):
+    """If not enough vertical space for needed_h, start a new page and redraw header."""
+    usable_bottom = pdf.h - BOTTOM_MARGIN_MM
+    if pdf.get_y() + needed_h > usable_bottom:
+        pdf.add_page()
+        pdf.set_y(page_top_y(pdf))
+        redraw_header_cb()
+
+
+def _draw_cell_box(pdf: FPDF, x: float, y: float, w: float, h: float, fill: bool):
+    """Draw the outer cell rectangle once so we can place padded text inside."""
+    pdf.set_xy(x, y)
+    pdf.cell(w, h, "", border=1, fill=fill)
+
+
+def _text_at(pdf: FPDF, x: float, y: float, w: float, h: float, text: str, align: str, v_center: bool):
+    """
+    Write single-line text inside a box region (x,y,w,h) with optional vertical centering.
+    """
+    if v_center:
+        baseline_y = y + (h - pdf.ln_height_mm) / 2.0
+    else:
+        baseline_y = y + ROW_PAD_MM  # small top padding
+
+    pdf.set_xy(x, baseline_y)
+    pdf.cell(w, pdf.ln_height_mm, text, border=0, align=align,
+             new_x=XPos.RIGHT, new_y=YPos.TOP)
+
+
+def paginate_services_wrapped(
+    pdf: FPDF,
+    rows: List[List[str]],
+    col_widths: List[float],
+    headers: List[str]
+):
+    """
+    Services table renderer:
+      - Word-wrap for Description
+      - Numeric/date columns single-line + vertically centered
+      - Row padding
+      - Header repeat
+      - Splits a single very tall row across pages as needed
+    Assumes pdf.font_size_pt & pdf.ln_height_mm already set and caller positioned y.
+    """
+    row_h = pdf.ln_height_mm
+    usable_bottom = pdf.h - BOTTOM_MARGIN_MM
+
+    def redraw_header():
+        _draw_header(pdf, col_widths, headers, row_h)
+
+    # initial header
+    redraw_header()
+    fill = True
+
+    for row in rows:
+        date_txt, desc_txt, hrs_txt, rate_txt, amt_txt = row
+        desc_w = col_widths[1]
+
+        # Measure with current font
+        pdf.set_font(FONT_FAMILY, '', pdf.font_size_pt)
+        desc_lines = wrap_text_lines(pdf, desc_txt, desc_w - 2 * DESC_INNER_PAD_X)
+
+        # We may need to split this row across pages if it doesn't fit
+        start_idx = 0
+        while start_idx < len(desc_lines):
+            y0 = pdf.get_y()
+            # Max lines that fit on this page for the description, accounting for padding
+            available_h = usable_bottom - y0
+            # space for padded row at minimum is row_h + 2*ROW_PAD_MM
+            min_row_h = row_h + 2 * ROW_PAD_MM
+            if available_h < min_row_h:
+                pdf.add_page()
+                pdf.set_y(page_top_y(pdf))
+                redraw_header()
+                y0 = pdf.get_y()
+                available_h = usable_bottom - y0
+
+            # How many description lines can we fit this pass?
+            max_lines_here = max(1, floor((available_h - 2 * ROW_PAD_MM) / row_h))
+            end_idx = min(len(desc_lines), start_idx + max_lines_here)
+            this_lines = desc_lines[start_idx:end_idx]
+            this_row_h = ROW_PAD_MM + (row_h * max(1, len(this_lines))) + ROW_PAD_MM
+
+            x = LEFT_MARGIN_MM
+
+            # --- Draw the 5 cell boxes first (so borders look clean) ---
+            _draw_cell_box(pdf, x, y0, col_widths[0], this_row_h, fill); x += col_widths[0]  # Date
+            _draw_cell_box(pdf, x, y0, col_widths[1], this_row_h, fill); x += col_widths[1]  # Desc
+            _draw_cell_box(pdf, x, y0, col_widths[2], this_row_h, fill); x += col_widths[2]  # Hrs
+            _draw_cell_box(pdf, x, y0, col_widths[3], this_row_h, fill); x += col_widths[3]  # Rate
+            _draw_cell_box(pdf, x, y0, col_widths[4], this_row_h, fill)                      # Amt
+
+            # --- Now place text inside with padding ---
+            x = LEFT_MARGIN_MM
+            # Date (one-line, vertically centered)
+            _text_at(pdf, x, y0, col_widths[0], this_row_h, date_txt, 'L', v_center=True)
+            x += col_widths[0]
+
+            # Description (multi-line, padded)
+            text_x = x + DESC_INNER_PAD_X
+            text_y = y0 + ROW_PAD_MM
+            pdf.set_xy(text_x, text_y)
+            pdf.multi_cell(
+                col_widths[1] - 2 * DESC_INNER_PAD_X,
+                row_h,
+                "\n".join(this_lines),
+                border=0,
+                align='L',
+                fill=False
+            )
+            x += col_widths[1]
+
+            # Hrs / Rate / Amt (single line, vertically centered)
+            _text_at(pdf, x, y0, col_widths[2], this_row_h, hrs_txt, 'R', v_center=True)
+            x += col_widths[2]
+            _text_at(pdf, x, y0, col_widths[3], this_row_h, rate_txt, 'R', v_center=True)
+            x += col_widths[3]
+            _text_at(pdf, x, y0, col_widths[4], this_row_h, amt_txt, 'R', v_center=True)
+
+            # advance
+            pdf.set_y(y0 + this_row_h)
+            start_idx = end_idx
+
+        fill = not fill
+
+
 def paginate_table(pdf, rows, col_widths, headers, alignments=None):
     """
-    Draw rows + headers with auto-pagination and auto-shrink for overflow.
+    Generic table with simple single-line cells (used for COSTS).
     Assumes pdf.font_size_pt & pdf.ln_height_mm already set.
     """
-    x0        = LEFT_MARGIN_MM
-    row_h     = pdf.ln_height_mm
-    usable    = pdf.h - mm_from_inches(letterhead_margin_in()) - TOP_MARGIN_MM - BOTTOM_MARGIN_MM
+    row_h = pdf.ln_height_mm
+    usable_bottom = pdf.h - BOTTOM_MARGIN_MM
     base_size = pdf.font_size_pt
     min_size  = MIN_FONT_PT
 
     if alignments is None:
         alignments = ['L'] * len(col_widths)
 
-    def draw_header():
-        pdf.set_x(x0)
-        pdf.set_font(FONT_FAMILY, 'B', base_size)
-        pdf.set_fill_color(200, 220, 255)
-        for w, h in zip(col_widths, headers):
-            pdf.cell(w, row_h, h, border=1, align='C', fill=True)
-        pdf.ln(row_h)
-        pdf.set_font(FONT_FAMILY, '', base_size)
-        pdf.set_fill_color(245, 245, 245)
+    def redraw_header():
+        _draw_header(pdf, col_widths, headers, row_h)
 
-    draw_header()
+    redraw_header()
     fill = True
     for row in rows:
-        if pdf.get_y() + row_h > usable:
-            pdf.add_page()
-            pdf.set_y(mm_from_inches(letterhead_margin_in()))
-            draw_header()
-        pdf.set_x(x0)
+        # ensure room
+        _ensure_room_or_new_page(pdf, row_h, redraw_header)
+
+        pdf.set_x(LEFT_MARGIN_MM)
         for w, cell, alg in zip(col_widths, row, alignments):
-            # measure and shrink if needed
             text_w = pdf.get_string_width(cell)
             if text_w > w - 2:
-                scale    = (w - 2) / text_w
+                scale    = (w - 2) / max(1e-6, text_w)
                 new_size = max(min_size, base_size * scale)
                 pdf.set_font(FONT_FAMILY, '', new_size)
             else:
                 pdf.set_font(FONT_FAMILY, '', base_size)
-            pdf.cell(w, row_h, cell, border=1, align=alg, fill=fill)
+            pdf.cell(w, row_h, cell, border=1, align=alg, fill=fill,
+                     new_x=XPos.RIGHT, new_y=YPos.TOP)
         pdf.set_font(FONT_FAMILY, '', base_size)
         pdf.ln(row_h)
         fill = not fill
+
 
 def parse_input_date(s: str) -> datetime:
     parts = s.strip().split('/')
@@ -95,8 +308,10 @@ def parse_input_date(s: str) -> datetime:
         raise ValueError("Use M/D or M/D/YY")
     return datetime(y, m, d)
 
+
 def format_date(dt: datetime) -> str:
     return f"{dt.month}/{dt.day}/{dt.strftime('%y')}"
+
 
 def parse_user_date(s: str) -> datetime:
     s = s.strip()
@@ -116,19 +331,22 @@ def parse_user_date(s: str) -> datetime:
         raise ValueError("Use M/D, M/D/YY, or M/D/YYYY")
     return datetime(y, m, d)
 
+
 def format_date_full(dt: datetime) -> str:
     return dt.strftime("%m/%d/%Y")
 
-# ----- Filename helpers (settings-driven) ------------------------------------
 
+# ----- Filename helpers (settings-driven) ------------------------------------
 def sanitize_client(name: str) -> str:
     # keep letters, numbers, space, underscore, dash; collapse spaces to _
     s = re.sub(r"[^A-Za-z0-9 _\-]", "", name).strip()
     return re.sub(r"\s+", "_", s)
 
+
 def date_for_filename(ui_mmddyyyy: str) -> str:
     # Convert UI date MM/DD/YYYY to MM-DD-YYYY for filenames
     return ui_mmddyyyy.replace("/", "-")
+
 
 def render_filename_from_template(inv: "Invoice") -> str:
     """
@@ -145,24 +363,45 @@ def render_filename_from_template(inv: "Invoice") -> str:
     except Exception:
         return f"{client}_invoice[{date_str}].pdf"
 
+
+def uniquify_path(p: Path) -> Path:
+    """
+    If 'p' exists, return 'p' with ' (n)' inserted before the suffix,
+    counting up until a free name is found.
+    Example: foo.pdf -> foo.pdf, foo (1).pdf, foo (2).pdf, ...
+    """
+    parent, stem, suffix = p.parent, p.stem, p.suffix or ".pdf"
+    candidate = parent / f"{stem}{suffix}"
+    n = 1
+    while candidate.exists():
+        candidate = parent / f"{stem} ({n}){suffix}"
+        n += 1
+    return candidate
+
+
+# ---------- Domain ----------
 class LineItem:
     def __init__(self, date_obj, desc, hours, rate):
         self.date  = date_obj
         self.desc  = desc
         self.hours = hours
         self.rate  = rate
+
     @property
     def amount(self):
         return self.hours * self.rate
+
 
 class CostItem:
     def __init__(self, desc, qty, unit_price):
         self.desc       = desc
         self.qty        = qty
         self.unit_price = unit_price
+
     @property
     def total(self):
         return self.qty * self.unit_price
+
 
 class Invoice:
     def __init__(self, client_name, invoice_date, default_rate):
@@ -182,7 +421,7 @@ class Invoice:
         return sum(i.amount for i in self.services)
 
     def total_costs(self):
-        return sum(c.total  for c in self.costs)
+        return sum(c.total for c in self.costs)
 
     def grand_total(self):
         return self.total_services() + self.total_costs()
@@ -221,7 +460,7 @@ class Invoice:
         total_rows = svc_count + cost_count + 6
         chosen_pt  = None
         for pt in range(MAX_FONT_PT, MIN_FONT_PT-1, -1):
-            if total_rows * (pt*0.35) < (
+            if total_rows * (pt * 0.35) < (
                 FPDF(format=PAGE_FORMAT).h
                 - mm_from_inches(letterhead_margin_in())
                 - TOP_MARGIN_MM
@@ -237,81 +476,100 @@ class Invoice:
         pdf.font_size_pt = chosen_pt
         pdf.ln_height_mm = chosen_pt * 0.35
 
-        # letterhead margin + heading
-        pdf.set_y(mm_from_inches(letterhead_margin_in()))
-        pdf.set_font(FONT_FAMILY, 'B', chosen_pt+4)
-        pdf.cell(0, pdf.ln_height_mm*2, "Invoice", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.ln(pdf.ln_height_mm/2)
+        # letterhead margin + heading (page 1)
+        pdf.set_y(page_top_y(pdf))
+        pdf.set_font(FONT_FAMILY, 'B', chosen_pt + 4)
+        pdf.cell(0, pdf.ln_height_mm * 2, "Invoice",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(pdf.ln_height_mm / 2)
         pdf.set_font(FONT_FAMILY, '', chosen_pt)
-        pdf.cell(0, pdf.ln_height_mm, f"Invoice for: {self.client_name}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(0, pdf.ln_height_mm, f"Date:        {self.invoice_date}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, pdf.ln_height_mm, f"Invoice for: {self.client_name}",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(0, pdf.ln_height_mm, f"Date:        {self.invoice_date}",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(pdf.ln_height_mm)
 
-        # SERVICES table
+        # SERVICES table (wrapped description)
         svc_rows = [
-            [ format_date(i.date), i.desc, f"{i.hours:.2f}", f"{i.rate:,.2f}", f"{i.amount:,.2f}" ]
+            [format_date(i.date), i.desc, f"{i.hours:.2f}", f"{i.rate:,.2f}", f"{i.amount:,.2f}"]
             for i in sorted(self.services, key=lambda x: x.date)
         ]
         svc_col_w = [25, 80, 25, 30, 30]
-        svc_align = ['L', 'L', 'R', 'R', 'R']
-        paginate_table(pdf, svc_rows, svc_col_w, headers=["Date","Service","Hrs","Rate","Amt"], alignments=svc_align)
-        pdf.ln(pdf.ln_height_mm/2)
+
+        paginate_services_wrapped(
+            pdf, svc_rows, svc_col_w,
+            headers=["Date", "Service", "Hrs", "Rate", "Amt"]
+        )
+
+        pdf.ln(pdf.ln_height_mm / 2)
 
         # TOTAL SERVICE FEES row
-        row_h   = pdf.ln_height_mm
+        row_h = pdf.ln_height_mm
         w_label = sum(svc_col_w[:-1])
-        label   = "TOTAL SERVICE FEES"
-        text_w  = pdf.get_string_width(label)
-        if text_w > w_label-2:
-            new_pt = max(MIN_FONT_PT, chosen_pt*((w_label-2)/text_w))
+        label = "TOTAL SERVICE FEES"
+        text_w = pdf.get_string_width(label)
+        if text_w > w_label - 2:
+            new_pt = max(MIN_FONT_PT, chosen_pt * ((w_label - 2) / max(1e-6, text_w)))
             pdf.set_font(FONT_FAMILY, 'B', new_pt)
         else:
             pdf.set_font(FONT_FAMILY, 'B', chosen_pt)
         pdf.set_x(LEFT_MARGIN_MM)
-        pdf.cell(w_label, row_h, label,     border=1, align='R')
+        pdf.cell(w_label, row_h, label, border=1, align='R',
+                 new_x=XPos.RIGHT, new_y=YPos.TOP)
         pdf.set_font(FONT_FAMILY, 'B', chosen_pt)
-        pdf.cell(svc_col_w[-1], row_h, f"{self.total_services():,.2f}", border=1, align='R')
-        pdf.ln(row_h*1.5)
+        pdf.cell(svc_col_w[-1], row_h, f"{self.total_services():,.2f}", border=1, align='R',
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(row_h * 0.5)
 
-        # COSTS table
+        # COSTS table (single-line cells)
         cost_rows = [
-            [ c.desc, f"{c.qty:,.2f}", f"{c.unit_price:,.2f}", f"{c.total:,.2f}" ]
+            [c.desc, f"{c.qty:,.2f}", f"{c.unit_price:,.2f}", f"{c.total:,.2f}"]
             for c in self.costs
         ]
         cost_col_w = [80, 30, 30, 30]
         cost_align = ['L', 'R', 'R', 'R']
-        paginate_table(pdf, cost_rows, cost_col_w, headers=["Description","Qty","Unit","Total"], alignments=cost_align)
-        pdf.ln(pdf.ln_height_mm/2)
+
+        paginate_table(
+            pdf, cost_rows, cost_col_w,
+            headers=["Description", "Qty", "Unit", "Total"],
+            alignments=cost_align
+        )
+
+        pdf.ln(pdf.ln_height_mm / 2)
 
         # TOTAL COSTS row
         w_label2 = sum(cost_col_w[:-1])
-        label2   = "TOTAL COSTS"
-        text_w2  = pdf.get_string_width(label2)
-        if text_w2 > w_label2-2:
-            new_pt2 = max(MIN_FONT_PT, chosen_pt*((w_label2-2)/text_w2))
+        label2 = "TOTAL COSTS"
+        text_w2 = pdf.get_string_width(label2)
+        if text_w2 > w_label2 - 2:
+            new_pt2 = max(MIN_FONT_PT, chosen_pt * ((w_label2 - 2) / max(1e-6, text_w2)))
             pdf.set_font(FONT_FAMILY, 'B', new_pt2)
         else:
             pdf.set_font(FONT_FAMILY, 'B', chosen_pt)
         pdf.set_x(LEFT_MARGIN_MM)
-        pdf.cell(w_label2, row_h, label2,           border=1, align='R')
+        pdf.cell(w_label2, row_h, label2, border=1, align='R',
+                 new_x=XPos.RIGHT, new_y=YPos.TOP)
         pdf.set_font(FONT_FAMILY, 'B', chosen_pt)
-        pdf.cell(cost_col_w[-1], row_h, f"{self.total_costs():,.2f}", border=1, align='R')
-        pdf.ln(row_h*1.5)
+        pdf.cell(cost_col_w[-1], row_h, f"{self.total_costs():,.2f}", border=1, align='R',
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(row_h * 0.5)
 
         # Boxed Grand Total
-        pdf.set_font(FONT_FAMILY, 'B', chosen_pt+2)
+        pdf.set_font(FONT_FAMILY, 'B', chosen_pt + 2)
         gt = f"GRAND TOTAL: {self.grand_total():,.2f}"
         w_gt = pdf.get_string_width(gt) + 6
         pdf.set_x(pdf.w - LEFT_MARGIN_MM - w_gt)
-        pdf.set_draw_color(0,0,0)
+        pdf.set_draw_color(0, 0, 0)
         pdf.set_line_width(0.5)
-        pdf.cell(w_gt, row_h*1.2, gt, border=1, align='C')
+        pdf.cell(w_gt, row_h * 1.2, gt, border=1, align='C',
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
         # save
-        safe_date = self.invoice_date.replace('/','-')
-        out = filename or f"{self.client_name.replace(' ','_')}_invoice[{safe_date}].pdf"
+        safe_date = self.invoice_date.replace('/', '-')
+        out = filename or f"{self.client_name.replace(' ', '_')}_invoice[{safe_date}].pdf"
         pdf.output(out)
         print(f"PDF saved as: {out}")
+
 
 # ---- UI ----
 from PySide6.QtCore import Qt, QUrl
@@ -322,8 +580,16 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QDesktopServices
 
+
 def default_pdf_filename(inv: Invoice) -> str:
     return render_filename_from_template(inv)
+
+
+# ------------ duplicate matching helpers -------------
+def _svc_key(date_obj: datetime, desc: str, hours: float) -> Tuple[str, str, float]:
+    """Key used to detect duplicates: (ISO_date, normalized desc lower, rounded hours)."""
+    return (date_obj.strftime("%Y-%m-%d"), normalize_desc(desc).strip().lower(), round(float(hours), 4))
+
 
 class InvoiceWizard(QMainWindow):
     def __init__(self):
@@ -359,11 +625,9 @@ class InvoiceWizard(QMainWindow):
         self.rate_in = QDoubleSpinBox()
         self.rate_in.setDecimals(2)
         self.rate_in.setMinimum(0.01)
-               # max big enough
         self.rate_in.setMaximum(9999999.0)
         self.rate_in.setSingleStep(25.0)
-        # initial; will be overridden by settings
-        self.rate_in.setValue(250.0)
+        self.rate_in.setValue(250.0)  # initial; overridden by settings
 
         form1.addRow("Client's Name:", self.client_name_in)
         form1.addRow("Invoice Date:", self.date_in)
@@ -380,7 +644,6 @@ class InvoiceWizard(QMainWindow):
         self.client_name_in.returnPressed.connect(self.go_services)
         self.date_in.returnPressed.connect(self.go_services)
         self.rate_in.lineEdit().returnPressed.connect(self.go_services)
-
         self.meta_next.clicked.connect(self.go_services)
 
         # Load settings (rate, explicit-zero rule)
@@ -459,7 +722,7 @@ class InvoiceWizard(QMainWindow):
         self.setTabOrder(self.s_date, self.s_hours)
         self.setTabOrder(self.s_hours, self.s_add)
 
-        # Shortcuts
+        # Shortcut
         self.short_dup_service = QShortcut(QKeySequence("Ctrl+D"), self.page_services)
         self.short_dup_service.activated.connect(self.prefill_last_service)
 
@@ -495,6 +758,7 @@ class InvoiceWizard(QMainWindow):
         line2 = QFrame(); line2.setFrameShape(QFrame.HLine); v3.addWidget(line2)
         actions3 = QHBoxLayout()
         self.c_back = QPushButton("← Back")
+        # When you go to review, we dedupe Services automatically
         self.c_done = QPushButton("Done →")
         actions3.addWidget(self.c_back)
         actions3.addStretch(1)
@@ -513,7 +777,6 @@ class InvoiceWizard(QMainWindow):
         self.c_qty.lineEdit().returnPressed.connect(self.add_cost)
         self.c_price.lineEdit().returnPressed.connect(self.add_cost)
 
-        # Table edit -> save back to data
         self.c_table.itemChanged.connect(self.on_cost_item_changed)
 
         # Tab order for rapid cost entry
@@ -591,9 +854,54 @@ class InvoiceWizard(QMainWindow):
         self.update_totals_labels()
         self.stack.setCurrentWidget(self.page_services)
 
+    # ---------- DEDUPLICATION ----------
+    def _dedupe_services(self, silent: bool = False) -> int:
+        """
+        Remove duplicate services already in the invoice (same date+desc+hours).
+        Returns number of removed items. Rebuilds the Services table.
+        """
+        if self.invoice is None or not self.invoice.services:
+            return 0
+
+        seen: Set[Tuple[str, str, float]] = set()
+        unique: List[LineItem] = []
+        removed = 0
+
+        for it in self.invoice.services:
+            k = _svc_key(it.date, it.desc, it.hours)
+            if k in seen:
+                removed += 1
+            else:
+                seen.add(k)
+                unique.append(it)
+
+        if removed:
+            self.invoice.services = unique
+            # Rebuild table
+            self._suppress_service_table = True
+            try:
+                self.s_table.setRowCount(0)
+                for it in sorted(self.invoice.services, key=lambda x: x.date):
+                    r = self.s_table.rowCount()
+                    self.s_table.insertRow(r)
+                    self.s_table.setItem(r, 0, QTableWidgetItem(format_date(it.date)))
+                    self.s_table.setItem(r, 1, QTableWidgetItem(it.desc))
+                    self.s_table.setItem(r, 2, QTableWidgetItem(f"{it.hours:.2f}"))
+            finally:
+                self._suppress_service_table = False
+            self.update_totals_labels()
+            if not silent:
+                QMessageBox.information(self, "Duplicates removed",
+                                        f"Removed {removed} duplicate service item(s).")
+        return removed
+
     def go_review(self):
         if self.invoice is None:
             return
+
+        # Auto-dedupe before showing preview (in case you pasted/merged lists)
+        self._dedupe_services(silent=False)
+
         buf = io.StringIO()
         _stdout = sys.stdout
         try:
@@ -662,6 +970,15 @@ class InvoiceWizard(QMainWindow):
             return
 
         clean = normalize_desc(raw_desc)
+
+        # ---- DUPLICATE CHECK on entry ----
+        new_key = _svc_key(d_dt, clean, hrs)
+        if any(_svc_key(it.date, it.desc, it.hours) == new_key for it in self.invoice.services):
+            QMessageBox.warning(self, "Duplicate service",
+                                "That service (same date, description, and hours) is already on this invoice.")
+            self.clear_service_form()
+            return
+
         self.invoice.add_service(d_dt, clean, hrs)
         row = self.s_table.rowCount()
         self._suppress_service_table = True
@@ -721,6 +1038,19 @@ class InvoiceWizard(QMainWindow):
                 finally:
                     self._suppress_service_table = False
                 return
+            tentative_key = _svc_key(d_dt, svc.desc, svc.hours)
+            for i, other in enumerate(self.invoice.services):
+                if i == row:
+                    continue
+                if _svc_key(other.date, other.desc, other.hours) == tentative_key:
+                    QMessageBox.warning(self, "Duplicate service",
+                                        "This edit would duplicate another service. Change the value or delete one.")
+                    self._suppress_service_table = True
+                    try:
+                        item.setText(format_date(svc.date))
+                    finally:
+                        self._suppress_service_table = False
+                    return
             svc.date = d_dt
             self._suppress_service_table = True
             try:
@@ -729,6 +1059,19 @@ class InvoiceWizard(QMainWindow):
                 self._suppress_service_table = False
         elif col == 1:  # Description
             new_desc = normalize_desc(text)
+            tentative_key = _svc_key(svc.date, new_desc, svc.hours)
+            for i, other in enumerate(self.invoice.services):
+                if i == row:
+                    continue
+                if _svc_key(other.date, other.desc, other.hours) == tentative_key:
+                    QMessageBox.warning(self, "Duplicate service",
+                                        "This edit would duplicate another service. Change the value or delete one.")
+                    self._suppress_service_table = True
+                    try:
+                        item.setText(svc.desc)
+                    finally:
+                        self._suppress_service_table = False
+                    return
             svc.desc = new_desc
             self._suppress_service_table = True
             try:
@@ -748,6 +1091,19 @@ class InvoiceWizard(QMainWindow):
                 finally:
                     self._suppress_service_table = False
                 return
+            tentative_key = _svc_key(svc.date, svc.desc, val)
+            for i, other in enumerate(self.invoice.services):
+                if i == row:
+                    continue
+                if _svc_key(other.date, other.desc, other.hours) == tentative_key:
+                    QMessageBox.warning(self, "Duplicate service",
+                                        "This edit would duplicate another service. Change the value or delete one.")
+                    self._suppress_service_table = True
+                    try:
+                        item.setText(f"{svc.hours:.2f}")
+                    finally:
+                        self._suppress_service_table = False
+                    return
             svc.hours = val
             self._suppress_service_table = True
             try:
@@ -870,15 +1226,18 @@ class InvoiceWizard(QMainWindow):
             export_dir = Path.home()
 
         filename = default_pdf_filename(self.invoice)
-        outfile = Path(export_dir) / filename
+        base_path = Path(export_dir) / filename
 
-        # If path doesn't exist (or user wants a different folder), prompt and persist
-        if not outfile.parent.exists():
+        # If the folder in settings doesn't exist (or user wants a new one), prompt and persist
+        if not base_path.parent.exists():
             chosen = QFileDialog.getExistingDirectory(self, "Choose export folder", os.path.expanduser("~"))
             if not chosen:
                 return
             settings.set_("general.default_export_dir", chosen)
-            outfile = Path(chosen) / filename
+            base_path = Path(chosen) / filename
+
+        # Ensure unique filename like Windows: ..., (1), (2), ...
+        outfile = uniquify_path(base_path)
 
         try:
             self.invoice.generate_pdf(filename=str(outfile))
@@ -920,7 +1279,6 @@ class InvoiceWizard(QMainWindow):
 
     # ---- Reset to meta (legacy back) ----
     def confirm_reset_to_meta(self):
-        # Keep the discard dialog (you okayed this)
         if self.invoice and (self.invoice.services or self.invoice.costs):
             res = QMessageBox.question(
                 self,
@@ -959,13 +1317,11 @@ class InvoiceWizard(QMainWindow):
             self.status.showMessage(f"Services: ${svc_total:,.2f} | Hours: {hours_sum:.2f} | Costs: ${cost_total:,.2f} | Grand: ${grand:,.2f}")
 
     def load_settings(self):
-        # default rate
         try:
             rate = float(settings.get("general.default_rate", 250.0))
             self.rate_in.setValue(rate if rate > 0 else 250.0)
         except Exception:
             self.rate_in.setValue(250.0)
-        # require explicit zero hours (default True)
         self.require_explicit_zero = bool(settings.get("invoice.require_explicit_zero_hours", True))
 
     def persist_rate_now(self):
@@ -974,11 +1330,13 @@ class InvoiceWizard(QMainWindow):
         except Exception:
             pass
 
+
 def main():
     app = QApplication(sys.argv)
     w = InvoiceWizard()
     w.show()
     sys.exit(app.exec())
+
 
 if __name__ == '__main__':
     main()
