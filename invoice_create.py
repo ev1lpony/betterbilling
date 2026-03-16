@@ -259,6 +259,77 @@ def paginate_services_wrapped(
         fill = not fill
 
 
+def paginate_flat_fee_service(
+    pdf: FPDF,
+    desc_txt: str,
+    amount: float,
+    svc_col_w: List[float]
+):
+    """
+    Special-case renderer for flat-fee-only invoices:
+    - Merge Date/Hrs/Rate/part of Service into one wide 'Service' column
+    - Keep Amt column width/position identical to original layout.
+    """
+    row_h = pdf.ln_height_mm
+    usable_bottom = pdf.h - BOTTOM_MARGIN_MM
+
+    # Merge all but last col into Service
+    left_w = sum(svc_col_w[:-1])
+    amt_w = svc_col_w[-1]
+
+    def redraw_header():
+        pdf.set_x(LEFT_MARGIN_MM)
+        pdf.set_font(FONT_FAMILY, 'B', pdf.font_size_pt)
+        pdf.set_fill_color(200, 220, 255)
+        pdf.cell(left_w, row_h, "Service", border=1, align='C', fill=True,
+                 new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.cell(amt_w, row_h, "Amt", border=1, align='C', fill=True,
+                 new_x=XPos.LMARGIN, new_y=YPos.TOP)
+        pdf.ln(row_h)
+        pdf.set_font(FONT_FAMILY, '', pdf.font_size_pt)
+        pdf.set_fill_color(245, 245, 245)
+
+    redraw_header()
+
+    pdf.set_font(FONT_FAMILY, '', pdf.font_size_pt)
+    desc_lines = wrap_text_lines(pdf, desc_txt, left_w - 2 * DESC_INNER_PAD_X)
+
+    y0 = pdf.get_y()
+    available_h = usable_bottom - y0
+    min_row_h = row_h + 2 * ROW_PAD_MM
+    if available_h < min_row_h:
+        pdf.add_page()
+        pdf.set_y(page_top_y(pdf))
+        redraw_header()
+        y0 = pdf.get_y()
+        available_h = usable_bottom - y0
+
+    this_row_h = ROW_PAD_MM + (row_h * max(1, len(desc_lines))) + ROW_PAD_MM
+
+    x = LEFT_MARGIN_MM
+    _draw_cell_box(pdf, x, y0, left_w, this_row_h, True); x += left_w
+    _draw_cell_box(pdf, x, y0, amt_w, this_row_h, True)
+
+    # Description text
+    text_x = LEFT_MARGIN_MM + DESC_INNER_PAD_X
+    text_y = y0 + ROW_PAD_MM
+    pdf.set_xy(text_x, text_y)
+    pdf.multi_cell(
+        left_w - 2 * DESC_INNER_PAD_X,
+        row_h,
+        "\n".join(desc_lines),
+        border=0,
+        align='L',
+        fill=False
+    )
+
+    # Amount
+    _text_at(pdf, LEFT_MARGIN_MM + left_w, y0, amt_w, this_row_h,
+             f"{amount:,.2f}", 'R', v_center=True)
+
+    pdf.set_y(y0 + this_row_h)
+
+
 def paginate_table(pdf, rows, col_widths, headers, alignments=None):
     """
     Generic table with simple single-line cells (used for COSTS).
@@ -410,6 +481,9 @@ class Invoice:
         self.default_rate = default_rate
         self.services: List[LineItem] = []
         self.costs: List[CostItem]    = []
+        # Optional flat service fee (no hourly breakdown)
+        self.flat_fee_desc: str | None = None
+        self.flat_fee_amount: float | None = None
 
     def add_service(self, dt, desc, hrs):
         self.services.append(LineItem(dt, desc, hrs, self.default_rate))
@@ -418,7 +492,10 @@ class Invoice:
         self.costs.append(CostItem(desc, qty, unit_price))
 
     def total_services(self):
-        return sum(i.amount for i in self.services)
+        base = sum(i.amount for i in self.services)
+        if self.flat_fee_amount is not None:
+            return base + self.flat_fee_amount
+        return base
 
     def total_costs(self):
         return sum(c.total for c in self.costs)
@@ -429,17 +506,20 @@ class Invoice:
     def print_console(self):
         print(f"\n===== Invoice for {self.client_name} =====")
         print(f"Date: {self.invoice_date}    Rate: {self.default_rate:.2f}\n")
-        if self.services:
-            print("SERVICES:")
+        print("SERVICES:")
+        if not self.services and self.flat_fee_amount is None:
+            print("No services.\n")
+        else:
             print(f"{'Date':<10} {'Desc':<30} {'Hrs':>5} {'Rate':>8} {'Amt':>10}")
             print("-"*65)
             for i in sorted(self.services, key=lambda x: x.date):
                 print(f"{format_date(i.date):<10} {i.desc:<30}"
                       f" {i.hours:>5.2f} {i.rate:>8.2f} {i.amount:>10.2f}")
+            if self.flat_fee_amount is not None:
+                desc = self.flat_fee_desc or "Flat service fee"
+                print(f"{'':<10} {desc:<30} {'':>5} {'':>8} {self.flat_fee_amount:>10.2f}")
             print("-"*65)
             print(f"{'Total Service Fees':>55} {self.total_services():>10.2f}\n")
-        else:
-            print("No services.\n")
         if self.costs:
             print("COSTS:")
             print(f"{'Desc':<30} {'Qty':>5} {'Unit':>8} {'Total':>10}")
@@ -455,7 +535,7 @@ class Invoice:
 
     def generate_pdf(self, filename=None):
         # choose dynamic font
-        svc_count  = len(self.services) + 1
+        svc_count  = max(1, len(self.services) + (1 if self.flat_fee_amount is not None else 0)) + 1
         cost_count = len(self.costs) + 1
         total_rows = svc_count + cost_count + 6
         chosen_pt  = None
@@ -489,17 +569,43 @@ class Invoice:
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(pdf.ln_height_mm)
 
-        # SERVICES table (wrapped description)
-        svc_rows = [
-            [format_date(i.date), i.desc, f"{i.hours:.2f}", f"{i.rate:,.2f}", f"{i.amount:,.2f}"]
-            for i in sorted(self.services, key=lambda x: x.date)
-        ]
+        # SERVICES table
         svc_col_w = [25, 80, 25, 30, 30]
 
-        paginate_services_wrapped(
-            pdf, svc_rows, svc_col_w,
-            headers=["Date", "Service", "Hrs", "Rate", "Amt"]
-        )
+        # If it's a pure flat-fee invoice (no hourly services), render 2-column layout
+        if self.flat_fee_amount is not None and not self.services:
+            desc = self.flat_fee_desc or "Attorney Fees"
+            paginate_flat_fee_service(
+                pdf,
+                desc_txt=desc,
+                amount=self.flat_fee_amount,
+                svc_col_w=svc_col_w,
+            )
+        else:
+            # Normal 5-column layout (hourly services, possibly plus flat line)
+            svc_rows: List[List[str]] = []
+            for i in sorted(self.services, key=lambda x: x.date):
+                svc_rows.append([
+                    format_date(i.date),
+                    i.desc,
+                    f"{i.hours:.2f}",
+                    f"{i.rate:,.2f}",
+                    f"{i.amount:,.2f}"
+                ])
+            if self.flat_fee_amount is not None:
+                desc = self.flat_fee_desc or "Flat service fee"
+                svc_rows.append([
+                    "",
+                    desc,
+                    "",
+                    "",
+                    f"{self.flat_fee_amount:,.2f}"
+                ])
+
+            paginate_services_wrapped(
+                pdf, svc_rows, svc_col_w,
+                headers=["Date", "Service", "Hrs", "Rate", "Amt"]
+            )
 
         pdf.ln(pdf.ln_height_mm / 2)
 
@@ -576,7 +682,7 @@ from PySide6.QtCore import Qt, QUrl
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QStackedWidget, QVBoxLayout, QHBoxLayout,
     QFormLayout, QLabel, QLineEdit, QDoubleSpinBox, QPushButton, QTableWidget, QTableWidgetItem,
-    QMessageBox, QTextEdit, QGroupBox, QFrame, QStatusBar, QFileDialog
+    QMessageBox, QTextEdit, QGroupBox, QFrame, QStatusBar, QFileDialog, QCheckBox
 )
 from PySide6.QtGui import QShortcut, QKeySequence, QDesktopServices
 
@@ -629,9 +735,27 @@ class InvoiceWizard(QMainWindow):
         self.rate_in.setSingleStep(25.0)
         self.rate_in.setValue(250.0)  # initial; overridden by settings
 
+        # Flat-fee controls (optional)
+        self.flat_fee_chk = QCheckBox("Flat service fee (no hourly breakdown)")
+        self.flat_desc_in = QLineEdit()
+        self.flat_desc_in.setPlaceholderText("e.g. Attorney Fees")
+        self.flat_amount_in = QDoubleSpinBox()
+        self.flat_amount_in.setDecimals(2)
+        self.flat_amount_in.setMinimum(0.00)
+        self.flat_amount_in.setMaximum(9999999.0)
+        self.flat_amount_in.setSingleStep(50.0)
+
+        # start with flat-fee fields disabled until checkbox checked
+        self.flat_desc_in.setEnabled(False)
+        self.flat_amount_in.setEnabled(False)
+        self.flat_fee_chk.toggled.connect(self._on_flat_fee_toggled)
+
         form1.addRow("Client's Name:", self.client_name_in)
         form1.addRow("Invoice Date:", self.date_in)
         form1.addRow("Default hourly rate:", self.rate_in)
+        form1.addRow(self.flat_fee_chk)
+        form1.addRow("Flat fee description:", self.flat_desc_in)
+        form1.addRow("Flat fee amount:", self.flat_amount_in)
         v1.addLayout(form1)
 
         bar1 = QHBoxLayout()
@@ -829,6 +953,10 @@ class InvoiceWizard(QMainWindow):
     def _mark_hours_dirty(self, *_):
         self._hours_dirty = True
 
+    def _on_flat_fee_toggled(self, checked: bool):
+        self.flat_desc_in.setEnabled(checked)
+        self.flat_amount_in.setEnabled(checked)
+
     # ---- Meta navigation ----
     def go_services(self):
         name = self.client_name_in.text().strip()
@@ -846,13 +974,34 @@ class InvoiceWizard(QMainWindow):
             return
         inv_date = format_date_full(dt)
         self.date_in.setText(inv_date)
+
+        flat_checked = self.flat_fee_chk.isChecked()
+        flat_desc_raw = self.flat_desc_in.text().strip()
+        flat_amount = self.flat_amount_in.value()
+
+        if flat_checked:
+            if not flat_desc_raw:
+                QMessageBox.warning(self, "Validation", "Flat fee description cannot be empty.")
+                return
+            if flat_amount <= 0:
+                QMessageBox.warning(self, "Validation", "Flat fee amount must be > 0.")
+                return
+
         self.invoice = Invoice(name, inv_date, rate)
+
+        if flat_checked:
+            self.invoice.flat_fee_desc = normalize_desc(flat_desc_raw)
+            self.invoice.flat_fee_amount = float(flat_amount)
 
         # persist default rate through centralized settings
         self.persist_rate_now()
 
         self.update_totals_labels()
-        self.stack.setCurrentWidget(self.page_services)
+        # If flat fee, skip Services step and go straight to Costs; otherwise normal flow
+        if flat_checked:
+            self.stack.setCurrentWidget(self.page_costs)
+        else:
+            self.stack.setCurrentWidget(self.page_services)
 
     # ---------- DEDUPLICATION ----------
     def _dedupe_services(self, silent: bool = False) -> int:
@@ -932,6 +1081,9 @@ class InvoiceWizard(QMainWindow):
         self.client_name_in.clear()
         self.date_in.setText(datetime.now().strftime("%m/%d/%Y"))
         # keep rate_in as-is (it's persisted), user can change if needed
+        self.flat_fee_chk.setChecked(False)
+        self.flat_desc_in.clear()
+        self.flat_amount_in.setValue(0.00)
 
         self.stack.setCurrentWidget(self.page_meta)
         self.client_name_in.setFocus()
@@ -1279,7 +1431,7 @@ class InvoiceWizard(QMainWindow):
 
     # ---- Reset to meta (legacy back) ----
     def confirm_reset_to_meta(self):
-        if self.invoice and (self.invoice.services or self.invoice.costs):
+        if self.invoice and (self.invoice.services or self.invoice.costs or self.invoice.flat_fee_amount):
             res = QMessageBox.question(
                 self,
                 "Discard invoice?",
