@@ -1,11 +1,11 @@
 from __future__ import annotations
 
-import re
 from math import floor
 from pathlib import Path
 from typing import Callable
 
 from fpdf import FPDF, XPos, YPos
+from fpdf.enums import MethodReturnValue
 
 import settings
 from models import Invoice, format_date_short
@@ -48,43 +48,19 @@ def money(value: float) -> str:
 def wrap_text_lines(pdf: FPDF, text: str, max_width: float) -> list[str]:
     if not text:
         return [""]
-
-    tokens = [
-        token
-        for token in re.split(r"(\s+|[-,/;:])", text)
-        if token is not None and token != ""
-    ]
-    lines: list[str] = []
-    current = ""
-
-    for token in tokens:
-        candidate = current + token if current else token
-        if pdf.get_string_width(candidate) <= max_width - 0.5:
-            current = candidate
-            continue
-
-        if current:
-            lines.append(current.rstrip())
-            current = ""
-
-        if pdf.get_string_width(token) <= max_width - 0.5:
-            current = token.lstrip()
-            continue
-
-        buffer = ""
-        for char in token:
-            candidate = buffer + char
-            if pdf.get_string_width(candidate) > max_width - 0.5 and buffer:
-                lines.append(buffer)
-                buffer = char
-            else:
-                buffer = candidate
-        current = buffer
-
-    if current:
-        lines.append(current.rstrip())
-
-    return lines or [""]
+    # Measure with the same engine and cell margins used to draw the text.
+    # Counting lines ourselves misses explicit newlines and can make fpdf wrap
+    # a supposedly single-line value again, outside its row's border.
+    lines = pdf.multi_cell(
+        max_width,
+        pdf.ln_height_mm,
+        text,
+        dry_run=True,
+        output=MethodReturnValue.LINES,
+    ) or [""]
+    # fpdf returns core-font lines in its internal Latin-1 representation.
+    # Convert them back before drawing, which performs normalization again.
+    return [line.encode("latin-1").decode(pdf.core_fonts_encoding) for line in lines]
 
 
 def draw_header(
@@ -130,103 +106,13 @@ def draw_box(pdf: FPDF, x: float, y: float, width: float, height: float, fill: b
     pdf.cell(width, height, "", border=1, fill=fill)
 
 
-def draw_centered_text(
-    pdf: FPDF,
-    x: float,
-    y: float,
-    width: float,
-    height: float,
-    text: str,
-    align: str,
-) -> None:
-    baseline = y + (height - pdf.ln_height_mm) / 2.0
-    pdf.set_xy(x, baseline)
-    pdf.cell(
-        width,
-        pdf.ln_height_mm,
-        text,
-        border=0,
-        align=align,
-        new_x=XPos.RIGHT,
-        new_y=YPos.TOP,
-    )
-
-
 def paginate_services(
     pdf: FPDF,
     rows: list[list[str]],
     widths: list[float],
     headers: list[str],
 ) -> None:
-    row_height = pdf.ln_height_mm
-    usable_bottom = pdf.h - BOTTOM_MARGIN_MM
-
-    def redraw() -> None:
-        draw_header(pdf, widths, headers, row_height)
-
-    redraw()
-    fill = True
-
-    for row in rows:
-        date_text, desc_text, hrs_text, rate_text, amt_text = row
-        pdf.set_font(FONT_FAMILY, "", pdf.font_size_pt)
-        desc_lines = wrap_text_lines(
-            pdf,
-            desc_text,
-            widths[1] - (2 * DESC_INNER_PAD_X),
-        )
-
-        start = 0
-        while start < len(desc_lines):
-            y0 = pdf.get_y()
-            available = usable_bottom - y0
-            minimum = row_height + 2 * ROW_PAD_MM
-
-            if available < minimum:
-                pdf.add_page()
-                pdf.set_y(page_top_y(pdf))
-                redraw()
-                y0 = pdf.get_y()
-                available = usable_bottom - y0
-
-            max_lines = max(
-                1,
-                floor((available - 2 * ROW_PAD_MM) / row_height),
-            )
-            end = min(len(desc_lines), start + max_lines)
-            lines = desc_lines[start:end]
-            height = ROW_PAD_MM + row_height * max(1, len(lines)) + ROW_PAD_MM
-
-            x = LEFT_MARGIN_MM
-            for width in widths:
-                draw_box(pdf, x, y0, width, height, fill)
-                x += width
-
-            x = LEFT_MARGIN_MM
-            draw_centered_text(pdf, x, y0, widths[0], height, date_text, "L")
-            x += widths[0]
-
-            pdf.set_xy(x + DESC_INNER_PAD_X, y0 + ROW_PAD_MM)
-            pdf.multi_cell(
-                widths[1] - 2 * DESC_INNER_PAD_X,
-                row_height,
-                "\n".join(lines),
-                border=0,
-                align="L",
-                fill=False,
-            )
-            x += widths[1]
-
-            draw_centered_text(pdf, x, y0, widths[2], height, hrs_text, "R")
-            x += widths[2]
-            draw_centered_text(pdf, x, y0, widths[3], height, rate_text, "R")
-            x += widths[3]
-            draw_centered_text(pdf, x, y0, widths[4], height, amt_text, "R")
-
-            pdf.set_y(y0 + height)
-            start = end
-
-        fill = not fill
+    paginate_wrapped_table(pdf, rows, widths, headers, ["L", "L", "R", "R", "R"], 1)
 
 
 def paginate_flat_fee(
@@ -235,76 +121,16 @@ def paginate_flat_fee(
     amount: float,
     service_widths: list[float],
 ) -> None:
-    row_height = pdf.ln_height_mm
     left_width = sum(service_widths[:-1])
     amount_width = service_widths[-1]
-
-    def redraw() -> None:
-        pdf.set_x(LEFT_MARGIN_MM)
-        pdf.set_font(FONT_FAMILY, "B", pdf.font_size_pt)
-        pdf.set_fill_color(200, 220, 255)
-        pdf.cell(
-            left_width,
-            row_height,
-            "Service",
-            border=1,
-            align="C",
-            fill=True,
-            new_x=XPos.RIGHT,
-            new_y=YPos.TOP,
-        )
-        pdf.cell(
-            amount_width,
-            row_height,
-            "Amt",
-            border=1,
-            align="C",
-            fill=True,
-            new_x=XPos.LMARGIN,
-            new_y=YPos.TOP,
-        )
-        pdf.ln(row_height)
-        pdf.set_font(FONT_FAMILY, "", pdf.font_size_pt)
-        pdf.set_fill_color(245, 245, 245)
-
-    redraw()
-    lines = wrap_text_lines(
+    paginate_wrapped_table(
         pdf,
-        description,
-        left_width - 2 * DESC_INNER_PAD_X,
+        [[description, money(amount)]],
+        [left_width, amount_width],
+        ["Service", "Amt"],
+        ["L", "R"],
+        0,
     )
-    height = ROW_PAD_MM + row_height * max(1, len(lines)) + ROW_PAD_MM
-    ensure_room(pdf, height, redraw)
-
-    y0 = pdf.get_y()
-    draw_box(pdf, LEFT_MARGIN_MM, y0, left_width, height, True)
-    draw_box(
-        pdf,
-        LEFT_MARGIN_MM + left_width,
-        y0,
-        amount_width,
-        height,
-        True,
-    )
-
-    pdf.set_xy(LEFT_MARGIN_MM + DESC_INNER_PAD_X, y0 + ROW_PAD_MM)
-    pdf.multi_cell(
-        left_width - 2 * DESC_INNER_PAD_X,
-        row_height,
-        "\n".join(lines),
-        border=0,
-        align="L",
-    )
-    draw_centered_text(
-        pdf,
-        LEFT_MARGIN_MM + left_width,
-        y0,
-        amount_width,
-        height,
-        money(amount),
-        "R",
-    )
-    pdf.set_y(y0 + height)
 
 
 def paginate_simple_table(
@@ -314,43 +140,99 @@ def paginate_simple_table(
     headers: list[str],
     alignments: list[str],
 ) -> None:
+    paginate_wrapped_table(pdf, rows, widths, headers, alignments, 0)
+
+
+def fit_cell_text(
+    pdf: FPDF, text: str, width: float, base_size: float, style: str = ""
+) -> float:
+    pdf.set_font(FONT_FAMILY, style, base_size)
+    text_width = pdf.get_string_width(text)
+    usable_width = width - 2 * pdf.c_margin
+    size = max(MIN_FONT_PT, min(base_size, base_size * usable_width / max(text_width, 1e-6)))
+    pdf.set_font(FONT_FAMILY, style, size)
+    return size
+
+
+def paginate_wrapped_table(
+    pdf: FPDF,
+    rows: list[list[str]],
+    widths: list[float],
+    headers: list[str],
+    alignments: list[str],
+    description_column: int,
+) -> None:
     row_height = pdf.ln_height_mm
     base_size = pdf.font_size_pt
+    minimum = row_height + 2 * ROW_PAD_MM
+    usable_bottom = pdf.h - BOTTOM_MARGIN_MM
 
     def redraw() -> None:
+        pdf.set_font(FONT_FAMILY, "", base_size)
         draw_header(pdf, widths, headers, row_height)
 
+    # Do not strand a header at the bottom of a page without its first row.
+    ensure_room(pdf, row_height + minimum)
     redraw()
     fill = True
 
     for row in rows:
-        ensure_room(pdf, row_height, redraw)
-        pdf.set_x(LEFT_MARGIN_MM)
-
-        for width, value, alignment in zip(widths, row, alignments):
-            text_width = pdf.get_string_width(value)
-            if text_width > width - 2:
-                size = max(
-                    MIN_FONT_PT,
-                    base_size * ((width - 2) / max(text_width, 1e-6)),
-                )
-                pdf.set_font(FONT_FAMILY, "", size)
-            else:
+        columns: list[tuple[list[str], float]] = []
+        for index, (width, value) in enumerate(zip(widths, row)):
+            if index == description_column:
                 pdf.set_font(FONT_FAMILY, "", base_size)
+                lines = wrap_text_lines(pdf, value, width - 2 * DESC_INNER_PAD_X)
+                size = base_size
+            else:
+                size = fit_cell_text(pdf, value, width, base_size)
+                lines = wrap_text_lines(pdf, value, width)
+            columns.append((lines, size))
 
-            pdf.cell(
-                width,
-                row_height,
-                value,
-                border=1,
-                align=alignment,
-                fill=fill,
-                new_x=XPos.RIGHT,
-                new_y=YPos.TOP,
-            )
+        line_count = max(len(lines) for lines, _ in columns)
+        start = 0
+        while start < line_count:
+            ensure_room(pdf, minimum, redraw)
+            y0 = pdf.get_y()
+            available = usable_bottom - y0
+            max_lines = max(1, floor((available - 2 * ROW_PAD_MM) / row_height))
+            end = min(line_count, start + max_lines)
+            height = 2 * ROW_PAD_MM + row_height * (end - start)
 
+            x = LEFT_MARGIN_MM
+            for width in widths:
+                draw_box(pdf, x, y0, width, height, fill)
+                x += width
+
+            x = LEFT_MARGIN_MM
+            for index, (width, alignment, (all_lines, size)) in enumerate(
+                zip(widths, alignments, columns)
+            ):
+                # Keep the date and ordinary amounts visible on continuation
+                # pages, as in the recovered service-table layout.
+                lines = all_lines[start:end]
+                if index != description_column and len(all_lines) == 1:
+                    lines = all_lines
+                pdf.set_font(FONT_FAMILY, "", size)
+                if index == description_column:
+                    pdf.set_xy(x + DESC_INNER_PAD_X, y0 + ROW_PAD_MM)
+                    if lines:
+                        pdf.multi_cell(
+                            width - 2 * DESC_INNER_PAD_X,
+                            row_height,
+                            "\n".join(lines),
+                            border=0,
+                            align=alignment,
+                        )
+                else:
+                    baseline = y0 + (height - row_height * len(lines)) / 2
+                    for offset, line in enumerate(lines):
+                        pdf.set_xy(x, baseline + offset * row_height)
+                        pdf.cell(width, row_height, line, align=alignment)
+                x += width
+
+            pdf.set_y(y0 + height)
+            start = end
         pdf.set_font(FONT_FAMILY, "", base_size)
-        pdf.ln(row_height)
         fill = not fill
 
 
@@ -363,51 +245,140 @@ def total_row(
     row_height: float,
     font_size: float,
 ) -> None:
-    ensure_room(pdf, row_height)
+    value_size = fit_cell_text(pdf, value, value_width, font_size, "B")
+    value_lines = wrap_text_lines(pdf, value, value_width)
+    height = row_height * len(value_lines)
+    ensure_room(pdf, height)
+    y0 = pdf.get_y()
     pdf.set_x(LEFT_MARGIN_MM)
     pdf.set_font(FONT_FAMILY, "B", font_size)
     pdf.cell(
         label_width,
-        row_height,
+        height,
         label,
         border=1,
         align="R",
         new_x=XPos.RIGHT,
         new_y=YPos.TOP,
     )
-    pdf.cell(
-        value_width,
-        row_height,
-        value,
-        border=1,
-        align="R",
-        new_x=XPos.LMARGIN,
-        new_y=YPos.NEXT,
+    draw_box(pdf, LEFT_MARGIN_MM + label_width, y0, value_width, height, False)
+    pdf.set_font(FONT_FAMILY, "B", value_size)
+    for offset, line in enumerate(value_lines):
+        pdf.set_xy(LEFT_MARGIN_MM + label_width, y0 + offset * row_height)
+        pdf.cell(value_width, row_height, line, align="R")
+    pdf.set_xy(LEFT_MARGIN_MM, y0 + height)
+    pdf.set_font(FONT_FAMILY, "B", font_size)
+
+
+def validate_pdf_text(inv: Invoice) -> None:
+    fields = [
+        ("client name", inv.client_name),
+        ("invoice date", inv.invoice_date),
+        ("flat fee description", inv.flat_fee_desc or ""),
+        *(("service description", item.desc) for item in inv.services),
+        *(("cost description", item.desc) for item in inv.costs),
+    ]
+    for label, text in fields:
+        try:
+            text.encode("cp1252")
+        except UnicodeEncodeError as exc:
+            character = text[exc.start]
+            raise ValueError(
+                f"The {label} contains {character!r}, which Helvetica cannot display. "
+                "Replace that character before exporting the PDF."
+            ) from exc
+
+
+def estimate_invoice_height(inv: Invoice, size: int) -> float:
+    """Measure wrapped rows so a smaller readable font can keep totals together."""
+    pdf = FPDF(format=PAGE_FORMAT)
+    pdf.core_fonts_encoding = "cp1252"
+    pdf.set_margins(LEFT_MARGIN_MM, TOP_MARGIN_MM, LEFT_MARGIN_MM)
+    pdf.add_page()
+    pdf.set_font(FONT_FAMILY, "", size)
+    pdf.ln_height_mm = row_height = size * 0.35
+    height = row_height * (
+        4.5 + len(wrap_text_lines(pdf, f"Invoice for: {inv.client_name}", pdf.epw))
     )
+
+    def table_height(rows: list[list[str]], widths: list[float], desc_column: int) -> float:
+        result = row_height
+        for row in rows:
+            count = 1
+            for index, (value, width) in enumerate(zip(row, widths)):
+                if index == desc_column:
+                    pdf.set_font(FONT_FAMILY, "", size)
+                    lines = wrap_text_lines(pdf, value, width - 2 * DESC_INNER_PAD_X)
+                else:
+                    fit_cell_text(pdf, value, width, size)
+                    lines = wrap_text_lines(pdf, value, width)
+                count = max(count, len(lines))
+            result += 2 * ROW_PAD_MM + count * row_height
+        return result
+
+    def value_height(value: str) -> float:
+        fit_cell_text(pdf, value, 30, size, "B")
+        return row_height * len(wrap_text_lines(pdf, value, 30))
+
+    service_rows = [
+        [format_date_short(item.date), item.desc, f"{item.hours:.2f}", money(item.rate), money(item.amount)]
+        for item in inv.services
+    ]
+    if inv.flat_fee_amount is not None and not inv.services:
+        height += table_height(
+            [[inv.flat_fee_desc or "Attorney Fees", money(inv.flat_fee_amount)]], [160, 30], 0
+        )
+    else:
+        if inv.flat_fee_amount is not None:
+            service_rows.append(["", inv.flat_fee_desc or "Flat service fee", "", "", money(inv.flat_fee_amount)])
+        height += table_height(service_rows, [25, 80, 25, 30, 30], 1)
+    if bool(settings.get("pdf.show_total_hours", True)):
+        height += value_height(f"{inv.total_hours():.2f}")
+    height += value_height(money(inv.total_services())) + row_height * 0.5
+    if inv.costs:
+        height += table_height(
+            [[item.desc, f"{item.qty:.2f}", money(item.unit_price), money(item.total)] for item in inv.costs],
+            [80, 30, 30, 30],
+            0,
+        )
+        height += value_height(money(inv.total_costs())) + row_height * 0.5
+    return height + row_height * 1.2
+
+
+def draw_paged_text(pdf: FPDF, text: str, width: float) -> None:
+    """Keep unusually long client names inside the printable area too."""
+    lines = wrap_text_lines(pdf, text, width)
+    start = 0
+    while start < len(lines):
+        ensure_room(pdf, pdf.ln_height_mm)
+        y0 = pdf.get_y()
+        capacity = max(1, floor((pdf.h - BOTTOM_MARGIN_MM - y0) / pdf.ln_height_mm))
+        end = min(len(lines), start + capacity)
+        pdf.set_x(LEFT_MARGIN_MM)
+        pdf.multi_cell(width, pdf.ln_height_mm, "\n".join(lines[start:end]))
+        pdf.set_y(y0 + (end - start) * pdf.ln_height_mm)
+        start = end
 
 
 def generate_pdf(inv: Invoice, filename: str | Path) -> Path:
+    # Validate before creating directories or replacing an existing export.
+    # Windows typography (curly quotes, en/em dashes, euro signs) is supported
+    # by core Helvetica using its Windows-1252 character mapping.
+    inv.validate()
+    validate_pdf_text(inv)
     target = Path(filename)
     target.parent.mkdir(parents=True, exist_ok=True)
 
-    service_rows_count = max(
-        1,
-        len(inv.services) + (1 if inv.flat_fee_amount is not None else 0),
-    )
-    total_rows = service_rows_count + len(inv.costs) + 8
-
-    chosen = None
+    available_height = FPDF(format=PAGE_FORMAT).h - BOTTOM_MARGIN_MM - mm_from_inches(letterhead_margin_in())
+    chosen = MIN_FONT_PT
     for size in range(MAX_FONT_PT, MIN_FONT_PT - 1, -1):
-        if total_rows * (size * 0.35) < (
-            FPDF(format=PAGE_FORMAT).h
-            - mm_from_inches(letterhead_margin_in())
-            - TOP_MARGIN_MM
-        ):
+        if estimate_invoice_height(inv, size) <= available_height:
             chosen = size
             break
-    chosen = chosen or MIN_FONT_PT
 
     pdf = FPDF(format=PAGE_FORMAT)
+    pdf.core_fonts_encoding = "cp1252"
+    pdf.set_margins(LEFT_MARGIN_MM, TOP_MARGIN_MM, LEFT_MARGIN_MM)
     pdf.set_auto_page_break(False)
     pdf.add_page()
     pdf.set_font(FONT_FAMILY, "", chosen)
@@ -425,13 +396,9 @@ def generate_pdf(inv: Invoice, filename: str | Path) -> Path:
     )
     pdf.ln(pdf.ln_height_mm / 2)
     pdf.set_font(FONT_FAMILY, "", chosen)
-    pdf.cell(
-        0,
-        pdf.ln_height_mm,
-        f"Invoice for: {inv.client_name}",
-        new_x=XPos.LMARGIN,
-        new_y=YPos.NEXT,
-    )
+    draw_paged_text(pdf, f"Invoice for: {inv.client_name}", pdf.epw)
+    ensure_room(pdf, pdf.ln_height_mm)
+    pdf.set_x(LEFT_MARGIN_MM)
     pdf.cell(
         0,
         pdf.ln_height_mm,
@@ -533,21 +500,25 @@ def generate_pdf(inv: Invoice, filename: str | Path) -> Path:
         )
         pdf.ln(row_height * 0.5)
 
-    ensure_room(pdf, row_height * 1.2)
-    pdf.set_font(FONT_FAMILY, "B", chosen + 2)
     grand = f"GRAND TOTAL: {money(inv.grand_total())}"
+    pdf.set_font(FONT_FAMILY, "B", chosen + 2)
+    available_width = pdf.w - 2 * LEFT_MARGIN_MM
+    text_width = pdf.get_string_width(grand)
+    if text_width + 6 > available_width:
+        size = max(MIN_FONT_PT, (chosen + 2) * (available_width - 6) / text_width)
+        pdf.set_font(FONT_FAMILY, "B", size)
     grand_width = pdf.get_string_width(grand) + 6
-    pdf.set_x(pdf.w - LEFT_MARGIN_MM - grand_width)
+    grand_width = min(grand_width, available_width)
+    grand_lines = wrap_text_lines(pdf, grand, grand_width)
+    grand_height = row_height * 1.2 * len(grand_lines)
+    ensure_room(pdf, grand_height)
+    x, y = pdf.w - LEFT_MARGIN_MM - grand_width, pdf.get_y()
     pdf.set_line_width(0.5)
-    pdf.cell(
-        grand_width,
-        row_height * 1.2,
-        grand,
-        border=1,
-        align="C",
-        new_x=XPos.LMARGIN,
-        new_y=YPos.NEXT,
-    )
+    draw_box(pdf, x, y, grand_width, grand_height, False)
+    for offset, line in enumerate(grand_lines):
+        pdf.set_xy(x, y + offset * row_height * 1.2)
+        pdf.cell(grand_width, row_height * 1.2, line, align="C")
+    pdf.set_xy(LEFT_MARGIN_MM, y + grand_height)
 
     pdf.output(str(target))
     return target
