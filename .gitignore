@@ -1,5 +1,10 @@
+.venv/
 venv/
 __pycache__/
-*.pdf
-*.json
+*.pyc
+.pytest_cache/
+.test-artifacts/
+pytest-cache-files-*/
 .betterbilling_settings.json
+bb_settings_*.json
+data/
