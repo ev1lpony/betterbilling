@@ -22,6 +22,10 @@ DEFAULTS: dict[str, Any] = {
         "default_rate": 250.0,
         "portable_mode": True,
     },
+    "appearance": {
+        "theme": "light",
+        "easy_reading": False,
+    },
     "invoice": {
         "require_explicit_zero_hours": True,
         "review_dedupe": True,
@@ -75,6 +79,7 @@ def _validate_settings(data: dict[str, Any]) -> dict[str, Any]:
         except ValueError:
             data[section][key] = DEFAULTS[section][key]
     for section, key in (
+        ("appearance", "easy_reading"),
         ("invoice", "require_explicit_zero_hours"),
         ("invoice", "review_dedupe"),
         ("pdf", "thousand_separators"),
@@ -82,6 +87,8 @@ def _validate_settings(data: dict[str, Any]) -> dict[str, Any]:
     ):
         if not isinstance(data[section][key], bool):
             data[section][key] = DEFAULTS[section][key]
+    if data["appearance"]["theme"] not in ("light", "dark"):
+        data["appearance"]["theme"] = "light"
     template = data["pdf"]["file_naming_template"]
     if not isinstance(template, str) or not template.strip():
         data["pdf"]["file_naming_template"] = DEFAULTS["pdf"]["file_naming_template"]

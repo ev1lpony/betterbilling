@@ -24,6 +24,16 @@ F1 context, literal text in rich review, visible small-window totals, and flat
 fee field visibility. Mouse number-arrow clicks and Help selection return pass.
 The new design keeps the existing invoice sequence.
 
+Appearance preferences suite:
+.venv\Scripts\python.exe -m pytest -q
+256 passed in 18.57s; exit code 0
+Includes 22 new appearance cases covering Light defaults, legacy settings,
+invalid values, persistence, live palettes/fonts, failed writes, draft/ID/focus
+preservation, visible Add in Easy Reading at1000x700, shortcuts, Help/Review
+recoloring, mouse number controls, Settings return cursor/selection, and selected
+text contrast pairs. All four theme/reading combinations rendered and inspected
+using synthetic records; artifacts ignored under .test-artifacts/appearance-qa/.
+
 Visual UI QA:
 Real Qt widget renders at 1200x800 and 1000x700 checked for Home, Details,
 Services, Costs, Review, Settings, and Help using synthetic invoice entries.

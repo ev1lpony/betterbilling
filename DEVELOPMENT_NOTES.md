@@ -107,3 +107,33 @@ selection, literal rich text, small-window Review totals, flat fee visibility,
 mouse clicks on styled number arrows, and mouse Help preserving text selection.
 Draft recovery, invoice search, and embedded PDF preview remain proposals for
 the user to approve; they were not added during this design pass.
+
+## Light/Dark and Easy Reading — October 1, 2026
+
+Settings now offers an Appearance section with a Light/Dark selector and Easy
+Reading checkbox. Fresh and migrated preferences default to Light with compact
+text. Settings merge missing appearance preferences in memory without rewriting
+an existing settings file. Invalid appearance values recover to safe defaults.
+Saving uses the existing atomic complete-settings transaction; a failed write
+restores the controls and keeps the prior cache and appearance.
+
+The shared theme uses semantic colors for the whole app, including menus,
+controls, selections, Help, and the rich invoice review. Easy Reading increases
+body text from 14px to 18px and invoice rows from 36px to 44px. Review and Help
+documents update in place. Entry columns expand slightly and retain a short
+vertical path to Add; it stays visible at 1000×700 in either theme. Settings
+returns to the previous page and field with cursor/selection preserved. Invoice
+models, stable IDs, dirty state, monetary values, and PDF output are unaffected.
+
+Synthetic Qt renders were inspected for all four combinations at 1200×800 and
+1000×700. Dedicated appearance regressions exercise preference reload, invalid
+values, failed saves, live draft preservation, reading geometry, shortcuts,
+mouse arrows, and Settings return focus. Selected active text/background pairs
+are checked against the 4.5:1 contrast threshold in the
+[W3C contrast guidance](https://www.w3.org/WAI/WCAG22/Understanding/contrast-minimum.html).
+
+Final verification: **256 tests passed in 18.57 seconds**, byte compilation,
+dependency consistency, and Git whitespace checks passed. Appearance QA images
+and isolated settings remain ignored under `.test-artifacts/appearance-qa/`.
+Recommendations for Home resume, draft recovery, and invoice search remain
+pending the user's product approval.

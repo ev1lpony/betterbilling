@@ -19,6 +19,13 @@ field and draft. Review shows a formatted invoice and a total that stays visible
 while scrolling. Save keeps the editable invoice; Save + Export PDF keeps both
 the editable invoice and its PDF.
 
+Settings → Appearance offers Light and Dark modes, plus Easy Reading for larger
+text throughout the app and roomier invoice rows. Light and the original compact
+text size are the defaults. Preferences apply immediately and are remembered
+between launches. Back from Settings returns to the screen and entry field you
+were using. Appearance preferences affect the screen; exported PDFs retain
+their original design.
+
 ## What this version deliberately preserves
 
 - Fast keyboard-first invoice entry

@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from ui_theme import appearance, appearance_manager, theme_colors
 
 
 TOPICS: dict[str, dict[str, str]] = {
@@ -37,6 +38,12 @@ TOPICS: dict[str, dict[str, str]] = {
                 <li>Check the entries and totals. Choose <b>Save + Export
                     PDF</b> to keep an editable invoice and a PDF.</li>
             </ol>
+            <h3>Make the screen comfortable</h3>
+            <p>Open <b>Settings</b> and look under <b>Appearance</b>. Choose
+                <b>Light</b> or <b>Dark</b>, or turn on <b>Easy Reading</b> for
+                larger text. These choices are remembered and leave your PDF
+                design unchanged. The Back button returns to your previous
+                screen and entry field.</p>
             <h3>Enter dates quickly</h3>
             <p>Use <b>4/30</b>, <b>4/30/25</b>, or <b>4/30/2025</b>.
                 Leaving off the year uses the current year.
@@ -258,13 +265,7 @@ class HelpDialog(QDialog):
         self.content.setOpenExternalLinks(False)
         self.content.setFont(QFont("Segoe UI", 12))
         self.content.document().setDefaultFont(QFont("Segoe UI", 12))
-        self.content.document().setDefaultStyleSheet(
-            "body { font-family: 'Segoe UI'; font-size: 12pt; } "
-            "h2 { font-size: 18pt; margin-bottom: 14px; } "
-            "h3 { font-size: 13pt; margin-top: 18px; margin-bottom: 8px; } "
-            "p, li { line-height: 145%; } "
-            "li { margin-bottom: 8px; }"
-        )
+        self.content.document().setDocumentMargin(14)
         body.addWidget(self.content, 1)
         layout.addLayout(body, 1)
 
@@ -282,6 +283,8 @@ class HelpDialog(QDialog):
         self.content.anchorClicked.connect(self._follow_link)
         self.finished.connect(self._restore_focus)
         self.topic_list.setCurrentRow(0)
+        appearance_manager().changed.connect(self._apply_appearance)
+        self._apply_appearance()
         self.setTabOrder(self.topic_list, self.content)
         self.setTabOrder(self.content, self.close_button)
 
@@ -301,11 +304,31 @@ class HelpDialog(QDialog):
     def _topic_changed(self, current: QListWidgetItem | None, _previous) -> None:
         if current is None:
             return
+        self._render_topic(current)
+        self.content.verticalScrollBar().setValue(0)
+
+    def _apply_appearance(self):
+        position = self.content.verticalScrollBar().value()
+        easy = appearance()[1]
+        colors = theme_colors()
+        self.content.document().setDefaultStyleSheet(
+            f"body {{ font-family: 'Segoe UI'; font-size: {15 if easy else 12}pt; color: {colors['ink']}; }} "
+            f"a {{ color: {colors['accent']}; }} "
+            f"h2 {{ font-size: {21 if easy else 18}pt; margin-bottom: 14px; }} "
+            f"h3 {{ font-size: {16 if easy else 13}pt; margin-top: 18px; margin-bottom: 8px; }} "
+            "p, li { line-height: 145%; } li { margin-bottom: 8px; }"
+        )
+        self.topic_list.setMaximumWidth(285 if easy else 245)
+        current = self.topic_list.currentItem()
+        if current is not None:
+            self._render_topic(current)
+            self.content.verticalScrollBar().setValue(position)
+
+    def _render_topic(self, current):
         topic = TOPICS[current.data(Qt.UserRole)]
         self.content.setHtml(
             f"<html><body><h2>{escape(topic['title'])}</h2>{topic['body']}</body></html>"
         )
-        self.content.verticalScrollBar().setValue(0)
 
     def _follow_link(self, url: QUrl) -> None:
         if url.scheme() == "help" and url.path() in TOPICS:

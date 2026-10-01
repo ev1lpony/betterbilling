@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 import settings
-from ui_theme import apply_theme, button, label
+from ui_theme import apply_theme, appearance_manager, font_sizes, theme_colors, button, label
 from help_ui import HelpDialog
 from models import (
     CostItem,
@@ -80,12 +80,13 @@ def set_numeric_value(field: QDoubleSpinBox, value: float, base_max: float) -> N
 
 
 class Header(QWidget):
-    def __init__(self, title: str, on_back):
+    def __init__(self, title: str, on_back, back_text: str = "Back to home"):
         super().__init__()
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         heading = label(title, "title")
-        back = button("Back to home", "quiet")
+        back = button(back_text, "quiet")
+        self.back_button = back
         back.clicked.connect(on_back)
         row.addWidget(heading, 1)
         row.addWidget(back)
@@ -222,17 +223,33 @@ class SettingsPage(QWidget):
         self.guard = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(28, 24, 28, 24)
-        layout.addWidget(Header("Settings", on_back))
-        layout.addWidget(label("Changes are saved as you make them. These preferences apply to future entries and exports.", "muted"))
+        self.header = Header("Settings", on_back, "Back")
+        layout.addWidget(self.header)
+        settings_note = label("Changes are saved as you make them. Appearance updates immediately; billing preferences apply to entries and exports.", "muted")
+        settings_note.setWordWrap(True)
+        layout.addWidget(settings_note)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         body = QWidget()
-        body.setMaximumWidth(850)
+        body.setMaximumWidth(940)
         form = QFormLayout(body)
         form.setContentsMargins(0, 20, 20, 20)
         form.setVerticalSpacing(16)
         scroll.setWidget(body)
+        self.theme = QComboBox()
+        self.theme.addItem("Light", "light")
+        self.theme.addItem("Dark", "dark")
+        self.theme.setAccessibleName("Color mode")
+        self.easy_reading = QCheckBox("Easy Reading — larger text and roomier rows")
+        self.easy_reading.setAccessibleName("Easy Reading")
+        form.addRow(label("Appearance", "section"))
+        form.addRow("Color mode:", self.theme)
+        form.addRow("", self.easy_reading)
+        appearance_note = label("Light is the default. Your choices are remembered. Invoice PDFs keep their original design.", "muted")
+        appearance_note.setWordWrap(True)
+        form.addRow(appearance_note)
+        form.addRow(label("Billing & PDF preferences", "section"))
         self.rate = QDoubleSpinBox()
         self.rate.setDecimals(2)
         self.rate.setRange(0.0, 9_999_999)
@@ -278,6 +295,8 @@ class SettingsPage(QWidget):
         layout.addWidget(note)
 
         self.rate.valueChanged.connect(self.save)
+        self.theme.currentIndexChanged.connect(self.save)
+        self.easy_reading.toggled.connect(self.save)
         self.explicit_zero.toggled.connect(self.save)
         self.review_dedupe.toggled.connect(self.save)
         self.thousands.toggled.connect(self.save)
@@ -290,6 +309,8 @@ class SettingsPage(QWidget):
     def load(self):
         self.guard = True
         try:
+            self.theme.setCurrentIndex(self.theme.findData(settings.get("appearance.theme", "light")))
+            self.easy_reading.setChecked(settings.get("appearance.easy_reading", False))
             set_numeric_value(self.rate, float(settings.get("general.default_rate", 250.0)), 9_999_999)
             self.explicit_zero.setChecked(
                 bool(settings.get("invoice.require_explicit_zero_hours", True))
@@ -321,6 +342,8 @@ class SettingsPage(QWidget):
         if self.guard:
             return
         data = deepcopy(settings.load_settings())
+        data["appearance"]["theme"] = self.theme.currentData()
+        data["appearance"]["easy_reading"] = self.easy_reading.isChecked()
         data["general"]["default_rate"] = float(self.rate.value())
         data["invoice"]["require_explicit_zero_hours"] = self.explicit_zero.isChecked()
         data["invoice"]["review_dedupe"] = self.review_dedupe.isChecked()
@@ -332,6 +355,9 @@ class SettingsPage(QWidget):
             settings.save_settings(data)
         except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "Settings not saved", str(exc))
+            self.load()
+            return
+        apply_theme(QApplication.instance())
 
 
 class InvoiceWorkspace(QMainWindow):
@@ -351,6 +377,7 @@ class InvoiceWorkspace(QMainWindow):
         self._cost_guard = False
         self._hours_dirty = False
         self.help_dialog = None
+        self.entry_scrolls = []
 
         central = QWidget()
         shell = QVBoxLayout(central)
@@ -401,6 +428,8 @@ class InvoiceWorkspace(QMainWindow):
         for field in (self.default_rate, self.flat_amount, self.s_hours, self.s_rate, self.c_qty, self.c_price):
             field.valueChanged.connect(lambda *_: self.set_dirty())
         self.rate_behavior.currentIndexChanged.connect(lambda *_: self.set_dirty())
+        appearance_manager().changed.connect(self._apply_appearance)
+        self._apply_appearance()
         self.start_new_invoice()
 
     def _page(self):
@@ -531,6 +560,7 @@ class InvoiceWorkspace(QMainWindow):
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setFixedWidth(310)
+        self.entry_scrolls.append(scroll)
         panel = QFrame()
         panel.setObjectName("entryPanel")
         fields = QVBoxLayout(panel)
@@ -586,6 +616,7 @@ class InvoiceWorkspace(QMainWindow):
         configure_table(self.s_table, 1)
         right.addWidget(self.s_table, 1)
         self.s_totals = label("", "section")
+        self.s_totals.setWordWrap(True)
         self.s_totals.setAlignment(Qt.AlignRight)
         right.addWidget(self.s_totals)
         content.addLayout(right, 1)
@@ -663,6 +694,7 @@ class InvoiceWorkspace(QMainWindow):
         self.c_table.setColumnWidth(2, 106)
         right.addWidget(self.c_table, 1)
         self.c_totals = label("", "section")
+        self.c_totals.setWordWrap(True)
         self.c_totals.setAlignment(Qt.AlignRight)
         right.addWidget(self.c_totals)
         content.addLayout(right, 1)
@@ -710,6 +742,7 @@ class InvoiceWorkspace(QMainWindow):
         self.preview.document().setDocumentMargin(16)
         layout.addWidget(self.preview, 1)
         self.review_totals = label("", "section")
+        self.review_totals.setWordWrap(True)
         self.review_totals.setAlignment(Qt.AlignRight)
         layout.addWidget(self.review_totals)
         self.filename_hint = label("", "muted")
@@ -744,6 +777,24 @@ class InvoiceWorkspace(QMainWindow):
     # ------------------------------------------------------------------
     # General state
     # ------------------------------------------------------------------
+
+    def _apply_appearance(self):
+        sizes = font_sizes()
+        for scroll in self.entry_scrolls:
+            scroll.setFixedWidth(350 if sizes["body"] > 14 else 310)
+            scroll.widget().layout().setSpacing(0 if sizes["body"] > 14 else 5)
+        for table, description_column in ((self.s_table, 1), (self.c_table, 0)):
+            table.verticalHeader().setDefaultSectionSize(sizes["row"])
+            metrics = table.horizontalHeader().fontMetrics()
+            for column in range(table.columnCount()):
+                if column != description_column:
+                    baseline = 106 if column == table.columnCount() - 1 else 94 if column == 0 else 82
+                    table.setColumnWidth(column, max(baseline, metrics.horizontalAdvance(table.horizontalHeaderItem(column).text()) + 24))
+        if self.invoice is not None:
+            scrollbar = self.preview.verticalScrollBar()
+            position = scrollbar.value()
+            self.preview.setHtml(self._preview_html())
+            scrollbar.setValue(position)
 
     def _toggle_flat_fee(self, enabled: bool):
         self.flat_desc.setEnabled(enabled)
@@ -1337,9 +1388,11 @@ class InvoiceWorkspace(QMainWindow):
         if self.invoice is None:
             return ""
         inv = self.invoice
+        colors = theme_colors()
+        sizes = font_sizes()
 
         def table(headings, rows):
-            header = "".join(f'<th align="{alignment}" bgcolor="#edf1f6">{escape(text)}</th>'
+            header = "".join(f'<th align="{alignment}" bgcolor="{colors["review_header"]}">{escape(text)}</th>'
                              for text, alignment in headings)
             body = "".join("<tr>" + "".join(
                 f'<td align="{headings[index][1]}">{escape(str(value))}</td>'
@@ -1357,12 +1410,12 @@ class InvoiceWorkspace(QMainWindow):
                       [(c.desc, f"{c.qty:.2f}", f"${money(c.unit_price)}", f"${money(c.total)}")
                        for c in inv.costs]) if inv.costs else "<p>No costs.</p>"
         return (
-            '<html><body style="font-family:Segoe UI; color:#202c3e; font-size:14px;">'
+            f'<html><body style="font-family:Segoe UI; color:{colors["ink"]}; font-size:{sizes["body"]}px;">'
             f'<h2>{escape(inv.client_name)}</h2><p>Invoice date: {escape(inv.invoice_date)}</p>'
             f'<h3>Services</h3>{services}<p align="right">Hours billed: {inv.total_hours():.2f}'
             f' &nbsp; · &nbsp; Service fees: ${money(inv.total_services())}</p>'
             f'<h3>Costs</h3>{costs}<p align="right">Total costs: ${money(inv.total_costs())}</p>'
-            f'<hr><p align="right" style="font-size:20px;"><b>Grand total: ${money(inv.grand_total())}</b></p>'
+            f'<hr><p align="right" style="font-size:{sizes["section"] + 3}px;"><b>Grand total: ${money(inv.grand_total())}</b></p>'
             '</body></html>'
         )
 
@@ -1505,7 +1558,8 @@ class MainWindow(QMainWindow):
         header.setObjectName("AppHeader")
         header_row = QHBoxLayout(header)
         header_row.setContentsMargins(24, 10, 24, 10)
-        brand = QLabel('<span style="font-size:22px; font-weight:700;">Better<span style="color:#244e81;">Billing</span></span>')
+        brand = QLabel()
+        self.brand = brand
         brand.setAccessibleName("BetterBilling")
         header_row.addWidget(brand)
         header_row.addSpacing(28)
@@ -1533,9 +1587,10 @@ class MainWindow(QMainWindow):
         )
         self.creator = CreatorPage(lambda: self.stack.setCurrentWidget(self.dashboard))
         self.manage = ManagePage(lambda: self.stack.setCurrentWidget(self.dashboard))
-        self.settings_page = SettingsPage(
-            lambda: self.stack.setCurrentWidget(self.dashboard)
-        )
+        self.settings_page = SettingsPage(self.go_back_from_settings)
+        self._settings_return_page = self.dashboard
+        self._settings_return_focus = None
+        self._settings_return_selection = None
 
         for page in (
             self.dashboard,
@@ -1552,6 +1607,14 @@ class MainWindow(QMainWindow):
         self.help_button.clicked.connect(self.show_help)
         self.help_shortcut = QShortcut(QKeySequence("F1"), self)
         self.help_shortcut.activated.connect(self.show_help)
+        appearance_manager().changed.connect(self._apply_appearance)
+        self._apply_appearance()
+
+    def _apply_appearance(self):
+        self.brand.setText(
+            f'<span style="font-size:{font_sizes()["brand"]}px; font-weight:700;">'
+            f'Better<span style="color:{theme_colors()["accent"]};">Billing</span></span>'
+        )
 
     def show_help(self):
         topic = None if self.stack.currentWidget() is self.creator else "files" if self.stack.currentWidget() is self.manage else "first_invoice"
@@ -1571,8 +1634,34 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.manage)
 
     def go_settings(self):
+        current = self.stack.currentWidget()
+        if current is not self.settings_page:
+            self._settings_return_page = current
+            self._settings_return_focus = QApplication.focusWidget()
+            field = self._settings_return_focus
+            self._settings_return_selection = (
+                field.cursorPosition(), field.selectionStart(), field.selectionLength()
+            ) if isinstance(field, QLineEdit) else None
+        target = self._settings_return_page
+        back_text = "Back to invoice" if target is self.creator else "Back to files" if target is self.manage else "Back to home"
+        self.settings_page.header.back_button.setText(back_text)
         self.settings_page.load()
         self.stack.setCurrentWidget(self.settings_page)
+
+    def go_back_from_settings(self):
+        self.stack.setCurrentWidget(self._settings_return_page)
+        previous = self._settings_return_focus
+        if previous is not None and previous.isVisible() and previous.isEnabled():
+            previous.setFocus(Qt.OtherFocusReason)
+            if isinstance(previous, QLineEdit) and self._settings_return_selection is not None:
+                cursor, start, length = self._settings_return_selection
+                if length:
+                    if cursor == start:
+                        previous.setSelection(start + length, -length)
+                    else:
+                        previous.setSelection(start, length)
+                else:
+                    previous.setCursorPosition(cursor)
 
     def closeEvent(self, event):
         if self.creator.workspace.confirm_discard_changes():
