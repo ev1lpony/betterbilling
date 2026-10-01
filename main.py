@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import os
 import sys
+from copy import deepcopy
+from decimal import Decimal
 from datetime import datetime
 from pathlib import Path
 
@@ -41,14 +43,15 @@ from models import (
     format_date_short,
     normalize_desc,
     parse_user_date,
+    validate_nonnegative_number,
 )
-from pdf_gen import generate_pdf, money
+from pdf_gen import money
 from storage import (
-    base_paths,
     list_invoice_json_files,
     load_invoice_json,
     paired_unique_paths,
     render_filename,
+    save_invoice_pair,
     save_invoice_json,
 )
 
@@ -61,6 +64,14 @@ def open_local_path(path: Path) -> None:
             QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
     except Exception:
         pass
+
+
+def set_numeric_value(field: QDoubleSpinBox, value: float, base_max: float) -> None:
+    """Display imported values without silently changing their precision/range."""
+    decimals = max(2, -Decimal(str(value)).as_tuple().exponent)
+    field.setDecimals(decimals)
+    field.setMaximum(max(base_max, value))
+    field.setValue(value)
 
 
 class Header(QWidget):
@@ -83,7 +94,7 @@ class Dashboard(QWidget):
         title = QLabel("BetterBilling")
         title.setStyleSheet("font-size:24px; font-weight:700;")
         subtitle = QLabel(
-            "Fast, portable invoice creation. Built from the recovered Wallace-era workflow."
+            "Make the invoice. Send it. Get back to work."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet("color:#666;")
@@ -161,7 +172,7 @@ class SettingsPage(QWidget):
         form = QFormLayout()
         self.rate = QDoubleSpinBox()
         self.rate.setDecimals(2)
-        self.rate.setRange(0.01, 9_999_999)
+        self.rate.setRange(0.0, 9_999_999)
         self.rate.setSingleStep(25.0)
 
         self.explicit_zero = QCheckBox("Require explicit 0 for no-charge services")
@@ -214,7 +225,7 @@ class SettingsPage(QWidget):
     def load(self):
         self.guard = True
         try:
-            self.rate.setValue(float(settings.get("general.default_rate", 250.0)))
+            set_numeric_value(self.rate, float(settings.get("general.default_rate", 250.0)), 9_999_999)
             self.explicit_zero.setChecked(
                 bool(settings.get("invoice.require_explicit_zero_hours", True))
             )
@@ -244,16 +255,18 @@ class SettingsPage(QWidget):
     def save(self, *_):
         if self.guard:
             return
-        settings.set_("general.default_rate", float(self.rate.value()))
-        settings.set_(
-            "invoice.require_explicit_zero_hours",
-            bool(self.explicit_zero.isChecked()),
-        )
-        settings.set_("invoice.review_dedupe", bool(self.review_dedupe.isChecked()))
-        settings.set_("pdf.thousand_separators", bool(self.thousands.isChecked()))
-        settings.set_("pdf.show_total_hours", bool(self.show_hours.isChecked()))
-        settings.set_("pdf.file_naming_template", self.filename.currentText())
-        settings.set_("letterhead.top_margin_in", float(self.letterhead.value()))
+        data = deepcopy(settings.load_settings())
+        data["general"]["default_rate"] = float(self.rate.value())
+        data["invoice"]["require_explicit_zero_hours"] = self.explicit_zero.isChecked()
+        data["invoice"]["review_dedupe"] = self.review_dedupe.isChecked()
+        data["pdf"]["thousand_separators"] = self.thousands.isChecked()
+        data["pdf"]["show_total_hours"] = self.show_hours.isChecked()
+        data["pdf"]["file_naming_template"] = self.filename.currentText()
+        data["letterhead"]["top_margin_in"] = float(self.letterhead.value())
+        try:
+            settings.save_settings(data)
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "Settings not saved", str(exc))
 
 
 class InvoiceWorkspace(QMainWindow):
@@ -267,6 +280,7 @@ class InvoiceWorkspace(QMainWindow):
         self.current_pdf_path: Path | None = None
         self.edit_mode = False
         self.dirty = False
+        self._loading = False
 
         self._service_guard = False
         self._cost_guard = False
@@ -282,6 +296,12 @@ class InvoiceWorkspace(QMainWindow):
         self._build_services_page()
         self._build_costs_page()
         self._build_review_page()
+
+        for field in (self.client, self.invoice_date, self.flat_desc, self.s_desc, self.s_date, self.c_desc):
+            field.textEdited.connect(lambda *_: self.set_dirty())
+        for field in (self.default_rate, self.flat_amount, self.s_hours, self.s_rate, self.c_qty, self.c_price):
+            field.valueChanged.connect(lambda *_: self.set_dirty())
+        self.rate_behavior.currentIndexChanged.connect(lambda *_: self.set_dirty())
 
         self.start_new_invoice()
 
@@ -338,7 +358,7 @@ class InvoiceWorkspace(QMainWindow):
 
         self.default_rate = QDoubleSpinBox()
         self.default_rate.setDecimals(2)
-        self.default_rate.setRange(0.01, 9_999_999)
+        self.default_rate.setRange(0.0, 9_999_999)
         self.default_rate.setSingleStep(25.0)
 
         self.rate_behavior = QComboBox()
@@ -380,6 +400,12 @@ class InvoiceWorkspace(QMainWindow):
         self.client.returnPressed.connect(self.go_services)
         self.invoice_date.returnPressed.connect(self.go_services)
         self.default_rate.lineEdit().returnPressed.connect(self.go_services)
+
+        for first, second in zip(
+            (self.client, self.invoice_date, self.default_rate, self.rate_behavior, self.flat_fee, self.flat_desc, self.flat_amount),
+            (self.invoice_date, self.default_rate, self.rate_behavior, self.flat_fee, self.flat_desc, self.flat_amount, next_btn),
+        ):
+            self.setTabOrder(first, second)
 
     def _build_services_page(self):
         self.page_services = QWidget()
@@ -440,9 +466,9 @@ class InvoiceWorkspace(QMainWindow):
         self.s_hours.lineEdit().textEdited.connect(self._mark_hours_dirty)
         add.clicked.connect(self.add_service)
         clear.clicked.connect(self.clear_service_form)
-        back.clicked.connect(lambda: self.stack.setCurrentWidget(self.page_meta))
+        back.clicked.connect(lambda: self._show_page(self.page_meta, self.client))
         remove.clicked.connect(self.remove_last_service)
-        done.clicked.connect(lambda: self.stack.setCurrentWidget(self.page_costs))
+        done.clicked.connect(self.go_costs)
         self.s_desc.returnPressed.connect(self.add_service)
         self.s_date.returnPressed.connect(self.add_service)
         self.s_hours.lineEdit().returnPressed.connect(self.add_service)
@@ -456,7 +482,12 @@ class InvoiceWorkspace(QMainWindow):
         self.setTabOrder(self.s_rate, add)
 
         self.dup_service_shortcut = QShortcut(QKeySequence("Ctrl+D"), self.page_services)
+        self.dup_service_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.dup_service_shortcut.activated.connect(self.prefill_last_service)
+        self.next_service_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.page_services)
+        self.next_service_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.next_service_shortcut.activated.connect(self.go_costs)
+        done.setToolTip("Continue to costs (Ctrl+Enter)")
 
     def _build_costs_page(self):
         self.page_costs = QWidget()
@@ -510,11 +541,10 @@ class InvoiceWorkspace(QMainWindow):
 
         add.clicked.connect(self.add_cost)
         clear.clicked.connect(self.clear_cost_form)
-        back.clicked.connect(
-            lambda: self.stack.setCurrentWidget(
-                self.page_meta if self.flat_fee.isChecked() else self.page_services
-            )
-        )
+        back.clicked.connect(lambda: self._show_page(
+            self.page_meta if self.flat_fee.isChecked() and not self.invoice.services else self.page_services,
+            self.client if self.flat_fee.isChecked() and not self.invoice.services else self.s_desc,
+        ))
         done.clicked.connect(self.go_review)
         self.c_desc.returnPressed.connect(self.add_cost)
         self.c_qty.lineEdit().returnPressed.connect(self.add_cost)
@@ -526,7 +556,12 @@ class InvoiceWorkspace(QMainWindow):
         self.setTabOrder(self.c_price, add)
 
         self.dup_cost_shortcut = QShortcut(QKeySequence("Ctrl+D"), self.page_costs)
+        self.dup_cost_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
         self.dup_cost_shortcut.activated.connect(self.prefill_last_cost)
+        self.next_cost_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.page_costs)
+        self.next_cost_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self.next_cost_shortcut.activated.connect(self.go_review)
+        done.setToolTip("Continue to review (Ctrl+Enter)")
 
     def _build_review_page(self):
         self.page_review = QWidget()
@@ -556,6 +591,7 @@ class InvoiceWorkspace(QMainWindow):
         back = QPushButton("← Back")
         save = QPushButton("Save")
         save_export = QPushButton("Save + Export PDF")
+        self.save_export_button = save_export
         save_as = QPushButton("Save As New")
         new_btn = QPushButton("New Invoice")
         row.addWidget(open_existing)
@@ -568,7 +604,7 @@ class InvoiceWorkspace(QMainWindow):
         layout.addLayout(row)
 
         open_existing.clicked.connect(self.go_open_page)
-        back.clicked.connect(lambda: self.stack.setCurrentWidget(self.page_costs))
+        back.clicked.connect(self.go_costs)
         save.clicked.connect(self.save_current)
         save_export.clicked.connect(self.save_and_export)
         save_as.clicked.connect(self.save_as_new)
@@ -587,6 +623,8 @@ class InvoiceWorkspace(QMainWindow):
         self._hours_dirty = True
 
     def set_dirty(self, dirty: bool = True):
+        if dirty and self._loading:
+            return
         self.dirty = dirty
         mode = "Editing Existing" if self.edit_mode else "New Invoice"
         self.mode_label.setText(f"Mode: {mode}{' *' if dirty else ''}")
@@ -601,7 +639,39 @@ class InvoiceWorkspace(QMainWindow):
         else:
             self.current_file_label.setText("This invoice has not been saved yet.")
 
-    def start_new_invoice(self):
+    def confirm_discard_changes(self) -> bool:
+        if not self.dirty:
+            return True
+        return QMessageBox.question(
+            self,
+            "Unsaved changes",
+            "Discard unsaved changes to this invoice?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        ) == QMessageBox.Yes
+
+    def closeEvent(self, event):
+        if self.confirm_discard_changes():
+            event.accept()
+        else:
+            event.ignore()
+
+    def _show_page(self, page, focus):
+        self.stack.setCurrentWidget(page)
+        focus.setFocus()
+        if isinstance(focus, QLineEdit):
+            focus.selectAll()
+
+    def go_costs(self):
+        self._show_page(self.page_costs, self.c_desc)
+
+    def _has_pending_entries(self) -> bool:
+        return bool(self.s_desc.text().strip() or self.c_desc.text().strip())
+
+    def start_new_invoice(self) -> bool:
+        if not self.confirm_discard_changes():
+            return False
+        self._loading = True
         default_rate = float(settings.get("general.default_rate", 250.0))
         today = datetime.now().strftime("%m/%d/%Y")
         self.invoice = Invoice("", today, default_rate)
@@ -611,20 +681,23 @@ class InvoiceWorkspace(QMainWindow):
 
         self.client.clear()
         self.invoice_date.setText(today)
-        self.default_rate.setValue(default_rate)
+        set_numeric_value(self.default_rate, default_rate, 9_999_999)
         self.rate_behavior.setCurrentIndex(0)
         self.flat_fee.setChecked(False)
         self.flat_desc.clear()
+        self.flat_amount.setDecimals(2)
+        self.flat_amount.setMaximum(9_999_999)
         self.flat_amount.setValue(0.0)
 
-        self.clear_service_form()
+        self.clear_service_form(reset_date=True)
         self.clear_cost_form()
         self._rebuild_service_table()
         self._rebuild_cost_table()
         self.update_totals()
+        self._loading = False
         self.set_dirty(False)
-        self.stack.setCurrentWidget(self.page_meta)
-        self.client.setFocus()
+        self._show_page(self.page_meta, self.client)
+        return True
 
     def _apply_meta(self) -> bool:
         if self.invoice is None:
@@ -646,8 +719,8 @@ class InvoiceWorkspace(QMainWindow):
             return False
 
         rate = float(self.default_rate.value())
-        if rate <= 0:
-            QMessageBox.warning(self, "Validation", "Default hourly rate must be > 0.")
+        if rate < 0:
+            QMessageBox.warning(self, "Validation", "Default hourly rate must be >= 0.")
             return False
 
         if self.flat_fee.isChecked():
@@ -660,17 +733,18 @@ class InvoiceWorkspace(QMainWindow):
                     "Flat fee description cannot be empty.",
                 )
                 return False
-            if amount <= 0:
+            if amount < 0:
                 QMessageBox.warning(
                     self,
                     "Validation",
-                    "Flat fee amount must be > 0.",
+                    "Flat fee amount must be >= 0.",
                 )
                 return False
         else:
             desc = ""
             amount = 0.0
 
+        old_values = (self.invoice.client_name, self.invoice.invoice_date, self.invoice.default_rate, self.invoice.flat_fee_desc, self.invoice.flat_fee_amount)
         old_rate = self.invoice.default_rate
         self.invoice.client_name = client
         self.invoice.invoice_date = format_date_full(date)
@@ -686,19 +760,26 @@ class InvoiceWorkspace(QMainWindow):
 
         if old_rate != rate and self.rate_behavior.currentIndex() == 1:
             self.invoice.apply_default_rate_to_all_services()
+            self._rebuild_service_table()
+            self.update_totals()
 
-        settings.set_("general.default_rate", rate)
+        if old_values != (self.invoice.client_name, self.invoice.invoice_date, self.invoice.default_rate, self.invoice.flat_fee_desc, self.invoice.flat_fee_amount):
+            self.set_dirty(True)
+        if float(settings.get("general.default_rate", 250.0)) != rate:
+            try:
+                settings.set_("general.default_rate", rate)
+            except OSError as exc:
+                self.status.showMessage(f"Invoice updated; default rate preference could not be saved: {exc}")
         return True
 
     def go_services(self):
         if not self._apply_meta():
             return
-        self.s_rate.setValue(self.invoice.default_rate)
-        self.set_dirty(True)
+        set_numeric_value(self.s_rate, self.invoice.default_rate, 9_999_999)
         if self.flat_fee.isChecked() and not self.invoice.services:
-            self.stack.setCurrentWidget(self.page_costs)
+            self.go_costs()
         else:
-            self.stack.setCurrentWidget(self.page_services)
+            self._show_page(self.page_services, self.s_desc)
 
     # ------------------------------------------------------------------
     # Existing invoices
@@ -712,18 +793,8 @@ class InvoiceWorkspace(QMainWindow):
             self.invoice_list.addItem(item)
 
     def go_open_page(self):
-        if self.dirty and self.invoice is not None:
-            answer = QMessageBox.question(
-                self,
-                "Unsaved changes",
-                "You have unsaved changes. Leave this invoice anyway?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if answer != QMessageBox.Yes:
-                return
         self.refresh_invoice_list()
-        self.stack.setCurrentWidget(self.page_open)
+        self._show_page(self.page_open, self.invoice_list)
 
     def open_selected(self):
         item = self.invoice_list.currentItem()
@@ -737,6 +808,9 @@ class InvoiceWorkspace(QMainWindow):
             QMessageBox.critical(self, "Open failed", str(exc))
             return
 
+        if not self.confirm_discard_changes():
+            return
+        self._loading = True
         self.invoice = invoice
         self.current_json_path = path
         expected_pdf = settings.get_export_dir() / f"{path.stem}.pdf"
@@ -745,29 +819,36 @@ class InvoiceWorkspace(QMainWindow):
 
         self.client.setText(invoice.client_name)
         self.invoice_date.setText(invoice.invoice_date)
-        self.default_rate.setValue(invoice.default_rate)
+        set_numeric_value(self.default_rate, invoice.default_rate, 9_999_999)
         self.rate_behavior.setCurrentIndex(0)
 
         self.flat_fee.setChecked(invoice.flat_fee_amount is not None)
         self.flat_desc.setText(invoice.flat_fee_desc or "")
-        self.flat_amount.setValue(float(invoice.flat_fee_amount or 0.0))
+        set_numeric_value(self.flat_amount, float(invoice.flat_fee_amount or 0.0), 9_999_999)
 
+        self.clear_service_form(reset_date=True)
+        self.clear_cost_form()
         self._rebuild_service_table()
         self._rebuild_cost_table()
         self.update_totals()
+        self._loading = False
         self.set_dirty(False)
-        self.stack.setCurrentWidget(self.page_meta)
+        self._show_page(self.page_meta, self.client)
 
     # ------------------------------------------------------------------
     # Services
     # ------------------------------------------------------------------
 
-    def clear_service_form(self):
+    def clear_service_form(self, reset_date: bool = False):
+        was_loading = self._loading
+        self._loading = True
         self.s_desc.clear()
-        self.s_date.setText(datetime.now().strftime("%m/%d/%Y"))
+        if reset_date or not self.s_date.text().strip():
+            self.s_date.setText(self.invoice_date.text() or datetime.now().strftime("%m/%d/%Y"))
         self.s_hours.setValue(0.0)
-        self.s_rate.setValue(float(self.default_rate.value()))
+        set_numeric_value(self.s_rate, float(self.default_rate.value()), 9_999_999)
         self._hours_dirty = False
+        self._loading = was_loading
         self.s_desc.setFocus()
         self.s_desc.selectAll()
 
@@ -791,6 +872,8 @@ class InvoiceWorkspace(QMainWindow):
                 for col, value in enumerate(values):
                     item = QTableWidgetItem(value)
                     item.setData(Qt.UserRole, service.line_id)
+                    if col == 4:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                     self.s_table.setItem(row, col, item)
         finally:
             self._service_guard = False
@@ -837,11 +920,13 @@ class InvoiceWorkspace(QMainWindow):
                 "Duplicate service",
                 "That exact service line already exists.",
             )
-            self.clear_service_form()
+            self.s_desc.setFocus()
+            self.s_desc.selectAll()
             return
 
         self.invoice.services.append(candidate)
         self._rebuild_service_table()
+        self.s_date.setText(format_date_full(date))
         self.clear_service_form()
         self.update_totals()
         self.set_dirty(True)
@@ -861,8 +946,8 @@ class InvoiceWorkspace(QMainWindow):
         last = self.invoice.services[-1]
         self.s_desc.setText(last.desc)
         self.s_date.setText(format_date_full(last.date))
-        self.s_hours.setValue(last.hours)
-        self.s_rate.setValue(last.rate)
+        set_numeric_value(self.s_hours, last.hours, 10_000)
+        set_numeric_value(self.s_rate, last.rate, 9_999_999)
         self._hours_dirty = True
         self.s_desc.setFocus()
         self.s_desc.selectAll()
@@ -898,16 +983,13 @@ class InvoiceWorkspace(QMainWindow):
                     raise ValueError("Description cannot be empty")
                 candidate.desc = normalize_desc(text)
             elif col == 2:
-                candidate.hours = float(text)
-                if candidate.hours < 0:
-                    raise ValueError("Hours must be >= 0")
+                candidate.hours = validate_nonnegative_number(text, "Hours")
             elif col == 3:
-                candidate.rate = float(text)
-                if candidate.rate < 0:
-                    raise ValueError("Rate must be >= 0")
+                candidate.rate = validate_nonnegative_number(text, "Rate")
             elif col == 4:
                 self._rebuild_service_table()
                 return
+            candidate.validate()
         except Exception as exc:
             QMessageBox.warning(self, "Validation", str(exc))
             self._rebuild_service_table()
@@ -936,9 +1018,12 @@ class InvoiceWorkspace(QMainWindow):
     # ------------------------------------------------------------------
 
     def clear_cost_form(self):
+        was_loading = self._loading
+        self._loading = True
         self.c_desc.clear()
         self.c_qty.setValue(0.0)
         self.c_price.setValue(0.0)
+        self._loading = was_loading
         self.c_desc.setFocus()
         self.c_desc.selectAll()
 
@@ -961,6 +1046,8 @@ class InvoiceWorkspace(QMainWindow):
                 for col, value in enumerate(values):
                     item = QTableWidgetItem(value)
                     item.setData(Qt.UserRole, cost.line_id)
+                    if col == 3:
+                        item.setFlags(item.flags() & ~Qt.ItemIsEditable)
                     self.c_table.setItem(row, col, item)
         finally:
             self._cost_guard = False
@@ -989,8 +1076,8 @@ class InvoiceWorkspace(QMainWindow):
             return
         last = self.invoice.costs[-1]
         self.c_desc.setText(last.desc)
-        self.c_qty.setValue(last.qty)
-        self.c_price.setValue(last.unit_price)
+        set_numeric_value(self.c_qty, last.qty, 1e9)
+        set_numeric_value(self.c_price, last.unit_price, 1e9)
         self.c_desc.setFocus()
         self.c_desc.selectAll()
 
@@ -1006,29 +1093,30 @@ class InvoiceWorkspace(QMainWindow):
 
         col = item.column()
         text = item.text().strip()
+        candidate = CostItem(cost.desc, cost.qty, cost.unit_price, cost.line_id)
         try:
             if col == 0:
                 if not text:
                     raise ValueError("Description cannot be empty")
-                cost.desc = normalize_desc(text)
+                candidate.desc = normalize_desc(text)
             elif col == 1:
-                value = float(text)
-                if value < 0:
-                    raise ValueError("Quantity must be >= 0")
-                cost.qty = value
+                value = validate_nonnegative_number(text, "Quantity")
+                candidate.qty = value
             elif col == 2:
-                value = float(text)
-                if value < 0:
-                    raise ValueError("Unit price must be >= 0")
-                cost.unit_price = value
+                value = validate_nonnegative_number(text, "Unit price")
+                candidate.unit_price = value
             elif col == 3:
                 self._rebuild_cost_table()
                 return
+            candidate.validate()
         except Exception as exc:
             QMessageBox.warning(self, "Validation", str(exc))
             self._rebuild_cost_table()
             return
 
+        cost.desc = candidate.desc
+        cost.qty = candidate.qty
+        cost.unit_price = candidate.unit_price
         self._rebuild_cost_table()
         self.update_totals()
         self.set_dirty(True)
@@ -1110,6 +1198,7 @@ class InvoiceWorkspace(QMainWindow):
             removed = self.invoice.dedupe_services()
             if removed:
                 self._rebuild_service_table()
+                self.set_dirty(True)
                 QMessageBox.information(
                     self,
                     "Duplicates removed",
@@ -1117,13 +1206,15 @@ class InvoiceWorkspace(QMainWindow):
                 )
 
         self.preview.setPlainText(self._preview_text())
-        self.filename_hint.setText(
-            f"Default file name: <b>{render_filename(self.invoice)}</b>"
-        )
+        try:
+            filename = render_filename(self.invoice)
+        except ValueError as exc:
+            self.filename_hint.setText(f"Check the filename template in Settings: {exc}")
+        else:
+            self.filename_hint.setText(f"Default file name: <b>{filename}</b>")
         self.update_totals()
         self._update_current_file_label()
-        self.stack.setCurrentWidget(self.page_review)
-        self.set_dirty(True)
+        self._show_page(self.page_review, self.save_export_button)
 
     def _current_paths(self) -> tuple[Path, Path]:
         if self.invoice is None:
@@ -1136,18 +1227,18 @@ class InvoiceWorkspace(QMainWindow):
             )
             return json_path, pdf_path
 
-        return base_paths(self.invoice)
+        return paired_unique_paths(self.invoice)
 
     def save_current(self):
         if self.invoice is None or not self._apply_meta():
             return
         try:
             json_path, pdf_path = self._current_paths()
-            save_invoice_json(self.invoice, json_path)
+            save_invoice_json(self.invoice, json_path, overwrite=self.edit_mode)
             self.current_json_path = json_path
             self.current_pdf_path = pdf_path
             self.edit_mode = True
-            self.set_dirty(False)
+            self.set_dirty(self._has_pending_entries())
             QMessageBox.information(self, "Saved", f"Saved:\n{json_path}")
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
@@ -1157,12 +1248,11 @@ class InvoiceWorkspace(QMainWindow):
             return
         try:
             json_path, pdf_path = self._current_paths()
-            save_invoice_json(self.invoice, json_path)
-            generate_pdf(self.invoice, pdf_path)
+            save_invoice_pair(self.invoice, json_path, pdf_path, overwrite=self.edit_mode)
             self.current_json_path = json_path
             self.current_pdf_path = pdf_path
             self.edit_mode = True
-            self.set_dirty(False)
+            self.set_dirty(self._has_pending_entries())
 
             msg = QMessageBox(self)
             msg.setWindowTitle("Invoice saved")
@@ -1184,12 +1274,11 @@ class InvoiceWorkspace(QMainWindow):
         try:
             # Paired allocation fixes the old JSON/PDF "(1)" mismatch possibility.
             json_path, pdf_path = paired_unique_paths(self.invoice)
-            save_invoice_json(self.invoice, json_path)
-            generate_pdf(self.invoice, pdf_path)
+            save_invoice_pair(self.invoice, json_path, pdf_path, overwrite=False)
             self.current_json_path = json_path
             self.current_pdf_path = pdf_path
             self.edit_mode = True
-            self.set_dirty(False)
+            self.set_dirty(self._has_pending_entries())
             QMessageBox.information(
                 self,
                 "Saved As New",
@@ -1211,7 +1300,7 @@ class CreatorPage(QWidget):
         layout.addWidget(self.workspace)
 
     def start_new(self):
-        self.workspace.start_new_invoice()
+        return self.workspace.start_new_invoice()
 
     def start_edit(self):
         self.workspace.go_open_page()
@@ -1250,8 +1339,9 @@ class MainWindow(QMainWindow):
         self.stack.setCurrentWidget(self.dashboard)
 
     def go_new(self):
-        self.creator.start_new()
-        self.stack.setCurrentWidget(self.creator)
+        if self.creator.start_new():
+            self.stack.setCurrentWidget(self.creator)
+            self.creator.workspace.client.setFocus()
 
     def go_edit(self):
         self.creator.start_edit()
@@ -1264,6 +1354,12 @@ class MainWindow(QMainWindow):
     def go_settings(self):
         self.settings_page.load()
         self.stack.setCurrentWidget(self.settings_page)
+
+    def closeEvent(self, event):
+        if self.creator.workspace.confirm_discard_changes():
+            event.accept()
+        else:
+            event.ignore()
 
 
 def main():
