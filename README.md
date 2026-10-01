@@ -4,6 +4,21 @@ This is the consolidated recovery build created after comparing the available
 legacy reconstruction, the BetterBilling Git history, the October 2025
 speed-first GUI, and the March 2026 JSON/editing refactors.
 
+## Compact interface
+
+The app now uses a consistent, compact design with vertically stacked entry
+fields beside the invoice table. Add sits directly below the fields; Tab,
+Enter, Ctrl+D, and Ctrl+Enter keep their existing behavior. The invoice steps
+remain Details → Services → Costs → Review & save. Flat fees retain their
+existing shortcut to Costs.
+
+Help is always available at the top of the app or through F1. It opens the
+relevant offline guide with practical examples for dates, hours, rates, costs,
+editing, saving, and backups. Close Help or press Escape to return to the same
+field and draft. Review shows a formatted invoice and a total that stays visible
+while scrolling. Save keeps the editable invoice; Save + Export PDF keeps both
+the editable invoice and its PDF.
+
 ## What this version deliberately preserves
 
 - Fast keyboard-first invoice entry

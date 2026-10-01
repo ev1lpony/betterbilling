@@ -5,10 +5,10 @@ from datetime import datetime
 import json
 
 import pytest
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QMessageBox, QPushButton
+from PySide6.QtWidgets import QHeaderView, QMessageBox, QPushButton
 
 import main
 import pdf_gen
@@ -284,7 +284,7 @@ def test_ctrl_d_prefills_service_when_entry_field_has_focus(workspace, qapp):
 def test_ctrl_d_prefills_cost_when_entry_field_has_focus(workspace, qapp):
     set_meta(workspace)
     workspace.go_services()
-    click_button(workspace.page_services, "Done →")
+    click_button(workspace.page_services, "Continue to costs")
     workspace.c_desc.setText("Postage")
     workspace.c_qty.setValue(2)
     workspace.c_price.setValue(9.85)
@@ -308,7 +308,7 @@ def test_page_transitions_focus_service_then_cost_description(workspace, qapp):
     qapp.processEvents()
     assert workspace.s_desc.hasFocus()
     workspace.s_rate.setFocus()
-    click_button(workspace.page_services, "Done →")
+    click_button(workspace.page_services, "Continue to costs")
     qapp.processEvents()
     assert workspace.stack.currentWidget() is workspace.page_costs
     assert workspace.c_desc.hasFocus()
@@ -360,7 +360,7 @@ def test_cost_add_inline_edit_review_and_save_roundtrip(workspace, dialogs):
     set_meta(workspace)
     workspace.go_services()
     add_service(workspace)
-    click_button(workspace.page_services, "Done →")
+    click_button(workspace.page_services, "Continue to costs")
     workspace.c_desc.setText("certified mail")
     workspace.c_qty.setValue(2)
     workspace.c_price.setValue(9.85)
@@ -373,7 +373,7 @@ def test_cost_add_inline_edit_review_and_save_roundtrip(workspace, dialogs):
     workspace.go_review()
     assert workspace.stack.currentWidget() is workspace.page_review
     assert "Certified mail" in workspace.preview.toPlainText()
-    assert "GRAND TOTAL: 404.55" in workspace.preview.toPlainText()
+    assert "Grand total: $404.55" in workspace.preview.toPlainText()
     workspace.save_current()
     assert not dialogs["critical"]
     assert not workspace.dirty
@@ -528,7 +528,7 @@ def test_save_keeps_unadded_entry_draft_dirty_and_guarded(workspace, dialogs, sa
     if draft_kind == "service":
         field = workspace.s_desc
     else:
-        click_button(workspace.page_services, "Done →")
+        click_button(workspace.page_services, "Continue to costs")
         field = workspace.c_desc
     type_text(field, "Pending unadded entry")
     assert workspace.dirty
@@ -668,7 +668,7 @@ def test_settings_reload_preserves_rate_precision_when_another_setting_changes(q
 def test_invalid_filename_setting_review_reports_feedback_without_crashing(workspace, dialogs):
     set_meta(workspace)
     workspace.go_services()
-    click_button(workspace.page_services, "Done →")
+    click_button(workspace.page_services, "Continue to costs")
     settings.set_("pdf.file_naming_template", "../folder/{client}.pdf")
     original_invoice = workspace.invoice
 
@@ -705,7 +705,7 @@ def test_ctrl_return_services_advances_without_adding_pending_entry(workspace, d
 def test_ctrl_return_costs_advances_without_adding_pending_entry(workspace, dialogs, qapp, field_name):
     set_meta(workspace)
     workspace.go_services()
-    click_button(workspace.page_services, "Done →")
+    click_button(workspace.page_services, "Continue to costs")
     workspace.c_desc.setText("Unadded cost draft")
     workspace.c_qty.setValue(2)
     workspace.c_price.setValue(9.85)
@@ -749,7 +749,7 @@ def test_ctrl_d_service_prefill_preserves_extra_precision(workspace, dialogs, qa
 def test_ctrl_d_cost_prefill_preserves_extra_precision(workspace, dialogs, qapp):
     set_meta(workspace)
     workspace.go_services()
-    click_button(workspace.page_services, "Done →")
+    click_button(workspace.page_services, "Continue to costs")
     original = workspace.invoice.add_cost("Precise cost", 1.005, 9.855)
     workspace._rebuild_cost_table()
     workspace.c_desc.setFocus()
@@ -767,3 +767,273 @@ def test_ctrl_d_cost_prefill_preserves_extra_precision(workspace, dialogs, qapp)
     assert copied.qty == original.qty
     assert copied.unit_price == original.unit_price
     assert copied.total == original.total
+
+
+def global_rect(widget):
+    return QRect(widget.mapToGlobal(QPoint(0, 0)), widget.size())
+
+
+@pytest.mark.parametrize("page_kind", ["services", "costs"])
+def test_compact_entry_fields_stack_left_of_table_with_add_directly_below(workspace, qapp, page_kind):
+    workspace.resize(1200, 800)
+    set_meta(workspace)
+    workspace.go_services()
+    if page_kind == "services":
+        panel, table = workspace.s_entry_panel, workspace.s_table
+        fields = [workspace.s_desc, workspace.s_date, workspace.s_hours, workspace.s_rate]
+        add_button = workspace.s_add_button
+    else:
+        workspace.go_costs()
+        panel, table = workspace.c_entry_panel, workspace.c_table
+        fields = [workspace.c_desc, workspace.c_qty, workspace.c_price]
+        add_button = workspace.c_add_button
+    qapp.processEvents()
+    assert global_rect(panel).right() < global_rect(table).left()
+    assert panel.width() < table.width()
+    rects = [global_rect(field) for field in fields]
+    assert all(first.bottom() < second.top() for first, second in zip(rects, rects[1:]))
+    assert all(abs(rect.left() - rects[0].left()) <= 2 for rect in rects)
+    add_rect = global_rect(add_button)
+    assert 0 < add_rect.top() - rects[-1].bottom() <= 32
+    assert global_rect(panel).contains(add_rect)
+    assert add_button.isVisible()
+
+
+@pytest.mark.parametrize("page_kind", ["services", "costs"])
+def test_description_column_receives_extra_table_width(workspace, qapp, page_kind):
+    workspace.resize(1200, 800)
+    set_meta(workspace)
+    workspace.go_services()
+    if page_kind == "services":
+        table, desc_column, amount_column = workspace.s_table, 1, 4
+    else:
+        workspace.go_costs()
+        table, desc_column, amount_column = workspace.c_table, 0, 3
+    qapp.processEvents()
+    header = table.horizontalHeader()
+    assert not header.stretchLastSection()
+    assert header.sectionResizeMode(desc_column) == QHeaderView.Stretch
+    assert header.sectionResizeMode(amount_column) != QHeaderView.Stretch
+    assert table.columnWidth(desc_column) > table.columnWidth(amount_column)
+
+
+@pytest.mark.parametrize("page_kind", ["services", "costs"])
+def test_compact_form_preserves_tab_order_through_add_button(workspace, qapp, page_kind):
+    set_meta(workspace)
+    workspace.go_services()
+    if page_kind == "services":
+        fields = [workspace.s_desc, workspace.s_date, workspace.s_hours, workspace.s_rate, workspace.s_add_button]
+    else:
+        workspace.go_costs()
+        fields = [workspace.c_desc, workspace.c_qty, workspace.c_price, workspace.c_add_button]
+    fields[0].setFocus()
+    qapp.processEvents()
+    for current, expected in zip(fields, fields[1:]):
+        editor = current.lineEdit() if hasattr(current, "lineEdit") else current
+        QTest.keyClick(editor, Qt.Key_Tab)
+        qapp.processEvents()
+        assert expected.hasFocus() or (
+            hasattr(expected, "lineEdit") and qapp.focusWidget() is expected.lineEdit()
+        )
+
+
+@pytest.mark.parametrize("page_kind", ["meta", "services", "costs", "review"])
+def test_context_help_preserves_draft_model_page_and_returns_keyboard_focus(workspace, qapp, page_kind):
+    set_meta(workspace)
+    workspace.go_services()
+    if page_kind == "meta":
+        workspace._show_page(workspace.page_meta, workspace.client)
+        draft_field = workspace.client
+    elif page_kind == "services":
+        draft_field = workspace.s_desc
+    else:
+        workspace.go_costs()
+        draft_field = workspace.c_desc
+        if page_kind == "review":
+            workspace.go_review()
+    type_text(draft_field, "Typed draft before opening Help")
+    if page_kind == "review":
+        workspace.save_export_button.setFocus()
+    qapp.processEvents()
+    prior_focus = qapp.focusWidget()
+    original_invoice = workspace.invoice
+    original_values = workspace.invoice.to_dict()
+    original_page = workspace.stack.currentWidget()
+    original_dirty = workspace.dirty
+
+    workspace.show_help()
+    qapp.processEvents()
+    dialog = workspace.help_dialog
+    assert dialog.isVisible()
+    assert not dialog.isModal()
+    assert workspace.invoice is original_invoice
+    assert workspace.invoice.to_dict() == original_values
+    assert workspace.stack.currentWidget() is original_page
+    assert workspace.dirty == original_dirty
+    assert draft_field.text() == "Typed draft before opening Help"
+
+    QTest.keyClick(dialog, Qt.Key_Escape)
+    qapp.processEvents()
+    qapp.processEvents()
+    assert workspace.invoice is original_invoice
+    assert workspace.invoice.to_dict() == original_values
+    assert workspace.stack.currentWidget() is original_page
+    assert workspace.dirty == original_dirty
+    assert draft_field.text() == "Typed draft before opening Help"
+    assert prior_focus.hasFocus() or qapp.focusWidget() is prior_focus
+
+
+def test_main_window_help_button_is_visible_and_opens_help(app_window, qapp):
+    assert app_window.help_button.isVisible()
+    assert "help" in app_window.help_button.text().lower()
+    app_window.help_button.click()
+    qapp.processEvents()
+    dialog = getattr(app_window, "help_dialog", None) or app_window.creator.workspace.help_dialog
+    assert dialog.isVisible()
+    assert not dialog.isModal()
+    QTest.keyClick(dialog, Qt.Key_Escape)
+    qapp.processEvents()
+
+
+@pytest.mark.parametrize("area,topic", [("home", "first_invoice"), ("services", "services"), ("costs", "costs")])
+def test_f1_opens_correct_help_without_shortcut_ambiguity(app_window, qapp, area, topic):
+    workspace = app_window.creator.workspace
+    if area == "home":
+        target = qapp.focusWidget() or app_window
+    else:
+        app_window.go_new()
+        set_meta(workspace)
+        workspace.go_services()
+        if area == "services":
+            target = workspace.s_desc
+        else:
+            workspace.go_costs()
+            target = workspace.c_desc
+        target.setFocus()
+    app_window.activateWindow()
+    qapp.processEvents()
+    original_page = workspace.stack.currentWidget()
+    original_dirty = workspace.dirty
+
+    QTest.keyClick(target, Qt.Key_F1)
+    qapp.processEvents()
+    assert workspace.help_dialog is not None
+    dialog = workspace.help_dialog
+    assert dialog.isVisible()
+    assert dialog.topic_list.currentItem().data(Qt.UserRole) == topic
+    assert workspace.stack.currentWidget() is original_page
+    assert workspace.dirty == original_dirty
+    QTest.keyClick(dialog, Qt.Key_Escape)
+    qapp.processEvents()
+
+
+def test_review_totals_stay_visible_without_horizontal_scroll_at_small_window(workspace, qapp):
+    workspace.resize(1000, 700)
+    set_meta(workspace)
+    workspace.go_services()
+    for day in range(1, 16):
+        workspace.invoice.add_service(
+            datetime(2025, 4, day),
+            f"Review client records and prepare correspondence for matter {day}",
+            1.25,
+            250,
+        )
+    workspace.invoice.add_cost("Certified mail", 2, 9.85)
+    workspace.invoice.add_cost("Filing postage", 1, 12.35)
+    workspace.go_review()
+    qapp.processEvents()
+    qapp.processEvents()
+    assert workspace.invoice.grand_total() == pytest.approx(4719.55)
+    assert workspace.review_totals.isVisible()
+    assert "4,719.55" in workspace.review_totals.text()
+    assert "grand total" in workspace.review_totals.text().lower()
+    assert global_rect(workspace.centralWidget()).contains(global_rect(workspace.review_totals))
+    assert workspace.preview.horizontalScrollBar().maximum() == 0
+
+
+def test_review_rich_text_displays_client_and_descriptions_as_literal_text(workspace):
+    client = "Client <b>One</b> & Sons"
+    service_desc = "Review <i>trust documents</i> & correspondence"
+    cost_desc = "Copies <b>exhibits</b> & postage"
+    set_meta(workspace, client=client)
+    workspace.go_services()
+    workspace.invoice.add_service(datetime(2025, 4, 1), service_desc, 1, 250)
+    workspace.invoice.add_cost(cost_desc, 1, 9.85)
+    workspace.go_review()
+    plain = workspace.preview.toPlainText()
+    assert client in plain
+    assert service_desc in plain
+    assert cost_desc in plain
+
+
+def test_flat_fee_fields_follow_checkbox_without_losing_typed_values(workspace, qapp):
+    assert workspace.stack.currentWidget() is workspace.page_meta
+    assert not workspace.flat_fee.isChecked()
+    for field in (workspace.flat_desc, workspace.flat_amount):
+        assert not field.isVisible()
+        assert not field.isEnabled()
+
+    workspace.flat_fee.click()
+    qapp.processEvents()
+    for field in (workspace.flat_desc, workspace.flat_amount):
+        assert field.isVisible()
+        assert field.isEnabled()
+    type_text(workspace.flat_desc, "Attorney fees")
+    workspace.flat_amount.setValue(1500)
+    workspace.flat_fee.click()
+    qapp.processEvents()
+    for field in (workspace.flat_desc, workspace.flat_amount):
+        assert not field.isVisible()
+        assert not field.isEnabled()
+
+    workspace.flat_fee.click()
+    qapp.processEvents()
+    assert workspace.flat_desc.text() == "Attorney fees"
+    assert workspace.flat_amount.value() == 1500
+    assert workspace.flat_desc.isVisible()
+    assert workspace.flat_amount.isVisible()
+
+
+@pytest.mark.parametrize("page_kind", ["services", "costs"])
+def test_styled_number_arrows_remain_clickable(workspace, qapp, page_kind):
+    from PySide6.QtWidgets import QStyle, QStyleOptionSpinBox
+
+    set_meta(workspace)
+    workspace.go_services()
+    if page_kind == "services":
+        field = workspace.s_hours
+    else:
+        workspace.go_costs()
+        field = workspace.c_qty
+    field.setValue(2)
+    qapp.processEvents()
+    original = field.value()
+    option = QStyleOptionSpinBox()
+    field.initStyleOption(option)
+    up = field.style().subControlRect(QStyle.CC_SpinBox, option, QStyle.SC_SpinBoxUp, field)
+    down = field.style().subControlRect(QStyle.CC_SpinBox, option, QStyle.SC_SpinBoxDown, field)
+    QTest.mouseClick(field, Qt.LeftButton, pos=up.center())
+    assert field.value() == pytest.approx(original + field.singleStep())
+    QTest.mouseClick(field, Qt.LeftButton, pos=down.center())
+    assert field.value() == pytest.approx(original)
+
+
+def test_mouse_help_button_preserves_service_field_selection(app_window, qapp):
+    app_window.go_new()
+    workspace = app_window.creator.workspace
+    set_meta(workspace)
+    workspace.go_services()
+    type_text(workspace.s_desc, "Mouse entry draft")
+    workspace.s_desc.setSelection(6, 5)
+    before = workspace.invoice.to_dict()
+    qapp.processEvents()
+    QTest.mouseClick(app_window.help_button, Qt.LeftButton)
+    qapp.processEvents()
+    assert workspace.help_dialog.isVisible()
+    assert workspace.invoice.to_dict() == before
+    QTest.keyClick(workspace.help_dialog, Qt.Key_Escape)
+    qapp.processEvents()
+    qapp.processEvents()
+    assert workspace.s_desc.hasFocus()
+    assert workspace.s_desc.selectedText() == "entry"
+    assert workspace.s_desc.text() == "Mouse entry draft"

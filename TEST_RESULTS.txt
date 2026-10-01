@@ -8,11 +8,28 @@ Baseline:
 python -m pytest -q: 3 passed
 python tests\test_core.py: failed imports; repaired in this iteration
 
-Final suite:
+Stabilization suite:
 .venv\Scripts\python.exe -m pytest -q
 199 passed in 8.33s; exit code 0
 98 model/storage/settings cases; 80 Qt GUI cases; 18 PDF cases; 3 original core cases
 All tests use synthetic data and isolated temporary storage/settings.
+
+Compact interface and Help suite:
+.venv\Scripts\python.exe -m pytest -q
+234 passed in 12.59s; exit code 0
+98 model/storage/settings; 100 Qt GUI; 15 Help; 18 PDF; 3 original core cases
+Includes original workflow/save regressions plus vertical entry fields, Add
+proximity, Tab order, Description column width, modeless Help draft/focus return,
+F1 context, literal text in rich review, visible small-window totals, and flat
+fee field visibility. Mouse number-arrow clicks and Help selection return pass.
+The new design keeps the existing invoice sequence.
+
+Visual UI QA:
+Real Qt widget renders at 1200x800 and 1000x700 checked for Home, Details,
+Services, Costs, Review, Settings, and Help using synthetic invoice entries.
+Installed Segoe UI fonts registered in the offscreen QA process; native app
+uses Windows fonts normally. SVG check/caret assets keep controls visible.
+Screens and scripts remain ignored under .test-artifacts/ui-qa/.
 
 Additional checks:
 Documented direct core command: 3 passed

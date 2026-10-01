@@ -75,3 +75,35 @@ been made. Packaging, licensing, clients, and cloud features remain future work.
 Final automated checks: **199 tests passed in 8.33 seconds**, source/test byte
 compilation passed, dependency consistency passed, and `git diff --check` passed.
 The documented direct core test command also passed its 3 tests.
+
+## Compact interface and practical Help — October 1, 2026
+
+The approved Compact direction now uses a narrow, vertical entry column beside
+the service/cost table. Add sits below the last field; mouse entry stays in one
+column. The description column receives spare table width and numeric cells
+align right. Existing handlers, stable IDs, invoice steps, date retention,
+Tab/Enter/Ctrl+D/Ctrl+Enter behavior, save operations, and the PDF layout remain
+in place. Flat fee fields appear when their checkbox is selected.
+
+`ui_theme.py` centralizes the neutral palette, type, focus states, and controls.
+Small SVG carets and checkmarks under `assets/ui` keep number controls and
+checkbox states visible. Their paths resolve from the module, including when
+the portable folder moves. `help_ui.py` provides six offline topics with
+current control names and worked examples. Help opens modelessly to the current
+step and returns focus/selection without mutating the draft. The Review screen
+escapes user text, presents readable tables, and keeps totals outside the
+scrolling content. Save and export messages use familiar names, with full paths
+available in details.
+
+Qt renders with synthetic records were inspected at 1200×800 and 1000×700 for
+Home, Details, Services, Costs, Review, Settings, and Help. Test-only font
+registration uses installed Segoe UI files because the offscreen Qt plugin
+does not discover Windows fonts. No user billing data is used for QA.
+
+Automated verification: **234 tests passed in 12.59 seconds**, including 100 Qt
+GUI cases and 15 independent Help cases. New regressions cover vertical field
+geometry, Add proximity, column sizing, focus/selection preservation, F1 topic
+selection, literal rich text, small-window Review totals, flat fee visibility,
+mouse clicks on styled number arrows, and mouse Help preserving text selection.
+Draft recovery, invoice search, and embedded PDF preview remain proposals for
+the user to approve; they were not added during this design pass.
