@@ -1,17 +1,41 @@
-returncode=0
+BetterBilling stabilization cycle — October 1, 2026
 
-STDOUT:
-Core tests passed.
+Environment:
+Windows; Python 3.13.13; project-local .venv
+PySide6 6.11.2; fpdf2 2.8.9; pytest 9.1.1; pypdf 6.19.0
 
+Baseline:
+python -m pytest -q: 3 passed
+python tests\test_core.py: failed imports; repaired in this iteration
 
-STDERR:
-Spreadsheet runtime warmup failed during python startup
-Traceback (most recent call last):
-  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/patches/warm_spreadsheet_runtime_on_startup.py", line 26, in warm_spreadsheet_runtime_on_startup
-  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/spreadsheet_warmup.py", line 785, in warm_spreadsheet_runtime
-  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/spreadsheet_warmup.py", line 720, in _warm_feature_flows
-  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/spreadsheet_warmup.py", line 704, in _warm_collaboration_flows
-  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/generated/interface/models.py", line 32317, in hydrate_crdt_from_proto
-  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/rpc/remote.py", line 749, in __call__
-  File "/tmp/tmp.L2TH2Y5coc/artifact_tool_v2-2.8.22/artifact_tool/rpc/client.py", line 150, in call
-artifact_tool.rpc.client.RemoteError: hydrateCrdtFromProto requires an empty collaborative document.
+Final suite:
+.venv\Scripts\python.exe -m pytest -q
+199 passed in 8.33s; exit code 0
+98 model/storage/settings cases; 80 Qt GUI cases; 18 PDF cases; 3 original core cases
+All tests use synthetic data and isolated temporary storage/settings.
+
+Additional checks:
+Documented direct core command: 3 passed
+compileall (application sources and tests): passed
+pip check: No broken requirements found
+git diff --check: passed
+
+Visual PDF QA:
+Poppler renders inspected: typical mixed (one page), very tall flat/service/cost
+descriptions, Windows punctuation, and extreme totals. Repeated headers, borders,
+text preservation, totals, and page bounds also checked automatically.
+
+Windows launch:
+Application launched; dashboard verified through native accessibility.
+Desktop helper screenshot capture timed out and native input hit a foreground
+error. Native end-to-end interaction therefore remains unverified; real Qt key
+events and major save/reopen/validation flows pass in the automated suite.
+
+Manual check remaining:
+Keyboard comfort and timed representative invoice (BENCHMARK.md), actual office
+PDF viewer/printer, and product feedback. No human 2:31 timing claim is made.
+
+Save durability limit:
+Each file is atomically committed. JSON/PDF are staged together and ordinary
+failures roll back; a sudden crash/power loss between their two replacements
+cannot be fully atomic. Original copies are retained if rollback fails.

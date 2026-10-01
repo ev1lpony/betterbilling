@@ -84,6 +84,10 @@ workflow.
 
 ## Run
 
+On this Windows workspace, double-click `RUN_BETTERBILLING.bat`. The project
+virtual environment is ready. Normal invoice creation and saving work offline;
+the first dependency installation requires Internet access.
+
 ```powershell
 py -m venv .venv
 .venv\Scripts\activate
@@ -91,11 +95,37 @@ pip install -r requirements.txt
 python main.py
 ```
 
-## Core test
+## Development tests
 
 ```powershell
-python tests\test_core.py
+.venv\Scripts\python.exe -m pip install -r requirements-dev.txt
+.venv\Scripts\python.exe -m pytest -q
 ```
 
-The GUI requires PySide6. The core tests exercise date parsing, totals, dedupe,
-and real PDF generation.
+Tests use temporary invoice folders and settings. They cover models, legacy
+JSON, malformed data, settings recovery, save failures, collisions, real PDF
+pagination, and Qt keyboard/editing behavior. The original direct command
+`python tests\test_core.py` also works after installing development dependencies.
+
+## First stabilization cycle
+
+- New invoices and Save As New preserve existing files, including collisions
+  with only one half of a JSON/PDF pair.
+- JSON writes are atomic. Save + Export stages both outputs and restores prior
+  files after ordinary replacement failures; failed PDF rendering leaves saved
+  records intact. A power loss between two final replacements remains a limit
+  of separate JSON/PDF files.
+- Invalid imported dates, rows, numbers, and unsupported schemas fail visibly;
+  valid legacy records remain editable, with repaired missing/repeated IDs.
+- Imported numeric precision and large values survive unrelated edits.
+- New Invoice and closing protect unsaved metadata, lines, and unfinished entry
+  drafts. A Save saves added rows; unfinished forms remain marked unsaved.
+- Service dates stay in place after adding a line. Enter adds; Ctrl+D prefills;
+  Ctrl+Enter advances from Services to Costs and from Costs to Review.
+- PDF descriptions wrap and paginate across services, costs, and flat fees.
+  Windows curly quotes and dashes work in Helvetica. Characters outside its
+  Windows-1252 coverage produce a clear export error; JSON can still be saved.
+
+See `DEVELOPMENT_NOTES.md` for verification details and `BENCHMARK.md` for the
+representative timed invoice check. Active work is on `recovered-master-dev`;
+the original repository history remains its parent.
