@@ -1,6 +1,10 @@
 from datetime import datetime
 from pathlib import Path
 import tempfile
+import sys
+
+if __name__ == "__main__":
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models import Invoice, LineItem, parse_user_date
 from pdf_gen import generate_pdf
@@ -47,7 +51,6 @@ def test_pdf():
 
 
 if __name__ == "__main__":
-    test_dates()
-    test_totals_and_dedupe()
-    test_pdf()
-    print("Core tests passed.")
+    import pytest
+
+    raise SystemExit(pytest.main([str(Path(__file__).resolve()), "-q"]))

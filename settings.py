@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import tempfile
+import shutil
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
@@ -57,6 +58,38 @@ def _deep_merge(existing: dict[str, Any], defaults: dict[str, Any]) -> dict[str,
 _cache: dict[str, Any] | None = None
 
 
+def _validate_settings(data: dict[str, Any]) -> dict[str, Any]:
+    """Repair invalid individual preferences without losing unknown keys."""
+    from models import validate_nonnegative_number
+
+    data = _deep_merge(data, deepcopy(DEFAULTS))
+    for section, key, minimum, maximum in (
+        ("general", "default_rate", 0.0, float("inf")),
+        ("letterhead", "top_margin_in", 0.0, 5.0),
+    ):
+        try:
+            value = validate_nonnegative_number(data[section][key], f"{section}.{key}")
+            if not minimum <= value <= maximum:
+                raise ValueError("Out of range")
+            data[section][key] = value
+        except ValueError:
+            data[section][key] = DEFAULTS[section][key]
+    for section, key in (
+        ("invoice", "require_explicit_zero_hours"),
+        ("invoice", "review_dedupe"),
+        ("pdf", "thousand_separators"),
+        ("pdf", "show_total_hours"),
+    ):
+        if not isinstance(data[section][key], bool):
+            data[section][key] = DEFAULTS[section][key]
+    template = data["pdf"]["file_naming_template"]
+    if not isinstance(template, str) or not template.strip():
+        data["pdf"]["file_naming_template"] = DEFAULTS["pdf"]["file_naming_template"]
+    data["version"] = DEFAULTS["version"]
+    data["general"]["portable_mode"] = True
+    return data
+
+
 def load_settings() -> dict[str, Any]:
     global _cache
     if _cache is not None:
@@ -65,18 +98,17 @@ def load_settings() -> dict[str, Any]:
     ensure_dirs()
     if SETTINGS_FILE.exists():
         try:
-            raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            raw = json.loads(SETTINGS_FILE.read_text(encoding="utf-8-sig"))
             if not isinstance(raw, dict):
                 raw = {}
-        except Exception:
+        except (OSError, ValueError):
             raw = {}
     else:
         raw = {}
 
-    data = _deep_merge(raw, deepcopy(DEFAULTS))
-    data["version"] = DEFAULTS["version"]
-    data.setdefault("general", {})["portable_mode"] = True
-    save_settings(data)
+    # Loading must not erase a damaged preference file. Migrations/defaults are
+    # applied in memory and written only when a preference is explicitly saved.
+    data = _validate_settings(raw)
     _cache = data
     return data
 
@@ -84,9 +116,9 @@ def load_settings() -> dict[str, Any]:
 def save_settings(data: dict[str, Any]) -> None:
     global _cache
     ensure_dirs()
-    data = _deep_merge(data, deepcopy(DEFAULTS))
-    data["version"] = DEFAULTS["version"]
-    data.setdefault("general", {})["portable_mode"] = True
+    if not isinstance(data, dict):
+        raise ValueError("Settings must be an object")
+    data = _validate_settings(deepcopy(data))
 
     fd, temp_name = tempfile.mkstemp(
         prefix="bb_settings_",
@@ -95,7 +127,27 @@ def save_settings(data: dict[str, Any]) -> None:
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(data, fh, indent=2, ensure_ascii=False)
+            json.dump(data, fh, indent=2, ensure_ascii=False, allow_nan=False)
+            fh.flush()
+            os.fsync(fh.fileno())
+        if SETTINGS_FILE.exists():
+            try:
+                original = json.loads(SETTINGS_FILE.read_text(encoding="utf-8-sig"))
+                needs_backup = not isinstance(original, dict)
+            except ValueError:
+                needs_backup = True
+            # An unreadable original must stay in place if it cannot be backed
+            # up. Let the write fail with an actionable error in that case.
+            if needs_backup:
+                backup_fd, backup_name = tempfile.mkstemp(
+                    prefix="bb_settings_recovery_", suffix=".json", dir=str(PROJECT_ROOT)
+                )
+                os.close(backup_fd)
+                try:
+                    shutil.copyfile(SETTINGS_FILE, backup_name)
+                except OSError:
+                    Path(backup_name).unlink(missing_ok=True)
+                    raise
         os.replace(temp_name, SETTINGS_FILE)
     finally:
         if os.path.exists(temp_name):
@@ -117,7 +169,7 @@ def get(path: str, default: Any = None) -> Any:
 
 
 def set_(path: str, value: Any) -> None:
-    data = load_settings()
+    data = deepcopy(load_settings())
     node = data
     parts = path.split(".")
     for part in parts[:-1]:
